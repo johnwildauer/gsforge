@@ -286,6 +286,11 @@ class GSProject:
         return self.root / "models"
 
     @property
+    def checkpoints_dir(self) -> Path:
+        """Directory for 3DGS training checkpoints (models/checkpoints/)."""
+        return self.root / "models" / "checkpoints"
+
+    @property
     def renders_dir(self) -> Path:
         """Directory for preview renders during training."""
         return self.root / "renders"
@@ -437,6 +442,61 @@ class GSProject:
     def is_training_done(self) -> bool:
         """Return True if 3DGS training has completed successfully."""
         return self.meta.training_status == "completed"
+
+    def get_latest_checkpoint(self) -> Optional[Path]:
+        """Return the path to the most recent checkpoint in models/checkpoints/.
+
+        Resolution order:
+          1. If ``meta.last_iteration`` is set and the matching file exists,
+             return it directly (fast path — avoids a directory scan).
+          2. Otherwise scan the checkpoints directory for ``ckpt_*.pth`` files
+             and return the one with the highest iteration number.
+          3. Return ``None`` if no checkpoints exist.
+
+        This method is safe to call on old projects that have no checkpoints
+        directory or no training metadata — it will simply return ``None``.
+        """
+        ckpt_dir = self.checkpoints_dir
+        if not ckpt_dir.is_dir():
+            return None
+
+        # Fast path: trust last_iteration from project.json
+        if self.meta.last_iteration is not None:
+            candidate = ckpt_dir / f"ckpt_{self.meta.last_iteration:06d}.pth"
+            if candidate.exists():
+                return candidate
+
+        # Fallback: scan directory for highest-numbered checkpoint
+        ckpt_files = sorted(ckpt_dir.glob("ckpt_*.pth"))
+        if not ckpt_files:
+            return None
+
+        # Sort by the numeric iteration embedded in the filename
+        def _iter_from_name(p: Path) -> int:
+            try:
+                return int(p.stem.split("_")[1])
+            except (IndexError, ValueError):
+                return -1
+
+        return max(ckpt_files, key=_iter_from_name)
+
+    def should_resume(self) -> bool:
+        """Return True when smart auto-resume should trigger by default.
+
+        Conditions (all must be true):
+          - ``training_status`` is ``"completed"`` (a previous run finished)
+          - ``last_iteration`` is recorded in project.json
+          - At least one checkpoint file exists in models/checkpoints/
+
+        This is intentionally conservative: if any condition is missing we
+        fall back to a fresh COLMAP initialisation rather than silently
+        resuming from an unexpected state.
+        """
+        if self.meta.training_status != "completed":
+            return False
+        if self.meta.last_iteration is None:
+            return False
+        return self.get_latest_checkpoint() is not None
 
     def require_ingest_done(self) -> None:
         """Exit with a helpful error if ingest has not been run yet."""

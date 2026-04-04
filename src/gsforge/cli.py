@@ -453,20 +453,71 @@ def train(
         "--preview-every",
         help=f"Save a preview render every N iterations. Default {DEFAULT_PREVIEW_EVERY}.",
     ),
+    resume: bool = typer.Option(
+        False,
+        "--resume",
+        help=(
+            "Resume training from the latest checkpoint in models/checkpoints/. "
+            "If no checkpoint exists, falls back to fresh COLMAP initialisation. "
+            "By default gsforge auto-resumes when training_status is 'completed' "
+            "in project.json — use this flag to force resume even when status is "
+            "'failed' or 'pending'."
+        ),
+        is_flag=True,
+    ),
+    resume_from: Optional[Path] = typer.Option(
+        None,
+        "--resume-from",
+        help=(
+            "Resume from a specific checkpoint file. "
+            "Accepts an absolute path or a filename relative to models/checkpoints/ "
+            "(e.g. --resume-from ckpt_012000.pth). "
+            "Takes precedence over --resume and smart auto-resume."
+        ),
+        exists=False,  # validated manually so we can check checkpoints_dir too
+        file_okay=True,
+        dir_okay=False,
+        resolve_path=False,
+    ),
+    no_resume: bool = typer.Option(
+        False,
+        "--no-resume",
+        "--restart",
+        help=(
+            "Force a fresh start from COLMAP, ignoring any existing checkpoints "
+            "and overriding smart auto-resume. Alias: --restart."
+        ),
+        is_flag=True,
+    ),
 ) -> None:
     """Train a 3D Gaussian Splatting model on the reconstructed scene.
 
     Loads the COLMAP sparse model from [bold]sfm/sparse/0/[/bold], trains
     with [bold]gsplat[/bold], and saves:
-      - Checkpoints in [bold]models/[/bold]
+      - Checkpoints in [bold]models/checkpoints/[/bold]
       - Final scene as [bold]models/final_scene.ply[/bold]
       - Preview renders in [bold]renders/[/bold]
+
+    [bold]Smart resume (default)[/bold]: if a previous training run completed
+    and a checkpoint exists, gsforge automatically continues from where it left
+    off.  Pass [bold]--restart[/bold] to override this and start fresh.
+
+    [bold]Resume precedence[/bold] (highest → lowest):
+      1. [bold]--restart[/bold] / [bold]--no-resume[/bold] → always start fresh
+      2. [bold]--resume-from PATH[/bold]                   → use that checkpoint
+      3. [bold]--resume[/bold]                             → use latest checkpoint
+      4. smart auto-resume from project.json               → if training completed
+      5. fallback                                          → fresh COLMAP init
 
     Requires a CUDA-capable GPU and gsplat installed with the correct
     PyTorch + CUDA version.
 
     Example:
         gsforge train
+        gsforge train --iterations 30000
+        gsforge train --resume
+        gsforge train --resume-from ckpt_015000.pth
+        gsforge train --restart --iterations 30000
         gsforge train --iterations 30000 --preview-every 1000
     """
     from gsforge.project import GSProject
@@ -475,9 +526,20 @@ def train(
     proj = GSProject.from_path(resolve_project_path(project))
     proj.require_sfm_done()
 
+    # Build a human-readable mode string for the log line
+    if no_resume:
+        mode_str = "restart"
+    elif resume_from is not None:
+        mode_str = f"resume-from={resume_from}"
+    elif resume:
+        mode_str = "resume-latest"
+    else:
+        mode_str = "auto"
+
     log_step(
         "train",
-        f"backend={backend}  iterations={iterations}  preview_every={preview_every}",
+        f"backend={backend}  iterations={iterations}  "
+        f"preview_every={preview_every}  mode={mode_str}",
     )
 
     train_module.run_training(
@@ -485,6 +547,9 @@ def train(
         backend=backend,
         iterations=iterations,
         preview_every=preview_every,
+        resume=resume,
+        resume_from=resume_from,
+        restart=no_resume,
     )
 
 

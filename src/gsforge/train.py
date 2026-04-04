@@ -53,7 +53,11 @@ DEFAULT_LR_MEANS: float = 1.6e-4
 DEFAULT_LR_OPACITIES: float = 5e-2
 DEFAULT_LR_SCALES: float = 5e-3
 DEFAULT_LR_QUATS: float = 1e-3
-DEFAULT_LR_SH: float = 2.5e-3
+DEFAULT_LR_SH0: float = 2.5e-3  # DC (degree-0) SH — drives base colour
+DEFAULT_LR_SHN: float = 2.5e-3 / 20  # Higher-order SH — 20× lower than DC, per gsplat
+# simple_trainer.py (shN_lr = sh0_lr / 20).
+# Using the same high LR for shN causes aggressive
+# view-dependent overfitting → "oily" rainbow artifact.
 
 # Densification schedule.
 # Wait 500 iters for Gaussians to settle before splitting/cloning.
@@ -705,7 +709,7 @@ class GsplatTrainer(BaseTrainer):
     Implements the full training pipeline:
       1. Input validation
       2. COLMAP data loading
-      3. Gaussian initialisation from sparse point cloud
+      3. Gaussian initialisation from sparse point cloud (or checkpoint)
       4. Optimisation loop with densification/pruning
       5. Periodic checkpointing and preview renders
       6. Final .ply export
@@ -715,13 +719,44 @@ class GsplatTrainer(BaseTrainer):
       - Split large Gaussians (over-reconstructed regions)
       - Prune transparent Gaussians (opacity < threshold)
       - Periodically reset opacities to prevent saturation
+
+    Parameters
+    ----------
+    resume_from : Optional[Path]
+        Path to a checkpoint ``.pth`` file to resume from.  When set, Gaussian
+        parameters are loaded from the checkpoint instead of being initialised
+        from the COLMAP sparse point cloud.  The training loop starts from
+        ``checkpoint["iteration"] + 1``.
     """
+
+    def __init__(
+        self,
+        project: "GSProject",
+        iterations: int,
+        preview_every: int,
+        resume_from: Optional[Path] = None,
+    ) -> None:
+        super().__init__(
+            project=project, iterations=iterations, preview_every=preview_every
+        )
+        self.resume_from: Optional[Path] = resume_from
 
     def train(self) -> TrainingResult:
         """Run the full gsplat training pipeline."""
         start_time = time.time()
 
-        log_step("Starting Training", f"backend=gsplat  iterations={self.iterations}")
+        if self.resume_from is not None:
+            log_step(
+                "Starting Training",
+                f"backend=gsplat  iterations={self.iterations}  "
+                f"resume={self.resume_from.name}",
+            )
+        else:
+            log_step(
+                "Starting Training",
+                f"backend=gsplat  iterations={self.iterations}  mode=fresh",
+            )
+
         self._validate_inputs()
         self._ensure_output_dirs()
 
@@ -749,42 +784,52 @@ class GsplatTrainer(BaseTrainer):
         log_step("Loading Data")
         colmap_data = load_colmap_data(self.sparse_dir)
 
-        if colmap_data.num_points == 0:
-            raise ValueError(
-                "COLMAP reconstruction has no 3D points.\n"
-                "  This usually means SfM failed to triangulate points.\n"
-                "  Re-run 'gsforge sfm' or check that images have sufficient overlap."
-            )
-
         if colmap_data.num_images == 0:
             raise ValueError(
                 "COLMAP reconstruction has no registered images.\n"
                 "  Re-run 'gsforge sfm' to regenerate the reconstruction."
             )
 
-        log_step("Preparing tensors")
+        # When resuming, COLMAP points are only needed for camera setup (not
+        # Gaussian init), so we skip the num_points == 0 guard in that path.
+        if self.resume_from is None and colmap_data.num_points == 0:
+            raise ValueError(
+                "COLMAP reconstruction has no 3D points.\n"
+                "  This usually means SfM failed to triangulate points.\n"
+                "  Re-run 'gsforge sfm' or check that images have sufficient overlap."
+            )
 
-        # Initial Gaussian means from sparse point cloud - shape (N, 3) float32.
-        # Initialising at COLMAP points gives a much better starting point than
-        # random init: the sparse cloud captures rough scene geometry so Gaussians
-        # only need to refine position/scale/colour rather than discover structure.
-        points_xyz = torch.tensor(
-            [[p.x, p.y, p.z] for p in colmap_data.points3d],
-            dtype=torch.float32,
-            device=torch_device,
-        )
+        # Build COLMAP-seeded tensors only for fresh starts.
+        if self.resume_from is None:
+            log_step("Preparing tensors", "initialising from COLMAP sparse points")
 
-        # Per-point colours from COLMAP - shape (N, 3) float32 in [0, 1].
-        # Seeds the spherical harmonic DC component (degree-0 colour).
-        point_colours = torch.tensor(
-            [[p.r / 255.0, p.g / 255.0, p.b / 255.0] for p in colmap_data.points3d],
-            dtype=torch.float32,
-            device=torch_device,
-        )
+            # Initial Gaussian means from sparse point cloud - shape (N, 3) float32.
+            # Initialising at COLMAP points gives a much better starting point than
+            # random init: the sparse cloud captures rough scene geometry so Gaussians
+            # only need to refine position/scale/colour rather than discover structure.
+            points_xyz = torch.tensor(
+                [[p.x, p.y, p.z] for p in colmap_data.points3d],
+                dtype=torch.float32,
+                device=torch_device,
+            )
 
-        log_info(
-            f"Initialising {points_xyz.shape[0]} Gaussians from sparse point cloud"
-        )
+            # Per-point colours from COLMAP - shape (N, 3) float32 in [0, 1].
+            # Seeds the spherical harmonic DC component (degree-0 colour).
+            point_colours = torch.tensor(
+                [[p.r / 255.0, p.g / 255.0, p.b / 255.0] for p in colmap_data.points3d],
+                dtype=torch.float32,
+                device=torch_device,
+            )
+
+            log_info(
+                f"Starting fresh from COLMAP — "
+                f"initialising {points_xyz.shape[0]:,} Gaussians from sparse point cloud"
+            )
+        else:
+            # Tensors will be loaded from checkpoint inside _train_with_gsplat.
+            points_xyz = None
+            point_colours = None
+
         log_step("Training", f"{self.iterations} iterations on {device.upper()}")
 
         try:
@@ -817,6 +862,85 @@ class GsplatTrainer(BaseTrainer):
             duration_seconds=duration,
         )
 
+    def _load_checkpoint(self, path: Path, torch_device) -> dict:
+        """Load and validate a training checkpoint.
+
+        Parameters
+        ----------
+        path : Path
+            Path to the ``.pth`` checkpoint file.
+        torch_device : torch.device
+            Device to map tensors onto.
+
+        Returns
+        -------
+        dict
+            Checkpoint payload with keys: ``iteration``, ``means``,
+            ``log_scales``, ``quats``, ``opacities_logit``, ``sh0``, ``shN``.
+
+        Raises
+        ------
+        FileNotFoundError
+            If the checkpoint file does not exist.
+        ValueError
+            If the checkpoint is missing required keys or contains
+            incompatible tensor shapes.
+        RuntimeError
+            If the file cannot be loaded (corrupt / wrong format).
+        """
+        import torch
+
+        if not path.exists():
+            raise FileNotFoundError(
+                f"Checkpoint not found: {path}\n"
+                "  Use --restart to start fresh from COLMAP, or specify a valid "
+                "checkpoint with --resume-from."
+            )
+
+        log_info(f"Loading checkpoint: {path.name}")
+        try:
+            ckpt = torch.load(str(path), map_location=torch_device, weights_only=True)
+        except Exception as exc:
+            raise RuntimeError(
+                f"Failed to load checkpoint {path.name}: {exc}\n"
+                "  The file may be corrupt or from an incompatible version.\n"
+                "  Use --restart to start fresh from COLMAP."
+            ) from exc
+
+        required_keys = {
+            "iteration",
+            "means",
+            "log_scales",
+            "quats",
+            "opacities_logit",
+            "sh0",
+            "shN",
+        }
+        missing = required_keys - set(ckpt.keys())
+        if missing:
+            raise ValueError(
+                f"Checkpoint {path.name} is missing required keys: {sorted(missing)}\n"
+                "  This checkpoint may be from an older version of gsforge.\n"
+                "  Use --restart to start fresh from COLMAP."
+            )
+
+        # Basic shape sanity checks
+        n = ckpt["means"].shape[0]
+        for key in ("log_scales", "quats", "opacities_logit", "sh0", "shN"):
+            if ckpt[key].shape[0] != n:
+                raise ValueError(
+                    f"Checkpoint {path.name}: tensor '{key}' has {ckpt[key].shape[0]} "
+                    f"rows but 'means' has {n}. The checkpoint may be corrupt.\n"
+                    "  Use --restart to start fresh from COLMAP."
+                )
+
+        start_iter = int(ckpt["iteration"]) + 1
+        log_info(
+            f"Resuming from iteration {ckpt['iteration']:,} — "
+            f"{n:,} Gaussians loaded from {path.name}"
+        )
+        return ckpt
+
     def _train_with_gsplat(
         self,
         torch_device,
@@ -830,7 +954,7 @@ class GsplatTrainer(BaseTrainer):
 
         Training loop:
           1. Build camera tensors from COLMAP data.
-          2. Initialise Gaussian parameters (means, scales, quats, opacities, SH).
+          2. Initialise Gaussian parameters — from checkpoint (resume) or COLMAP (fresh).
           3. For each iteration: sample camera, rasterise, compute loss, backprop.
           4. Densify/prune at scheduled intervals.
           5. Save checkpoint + preview render at preview_every intervals.
@@ -883,50 +1007,143 @@ class GsplatTrainer(BaseTrainer):
         train_H = cam_heights[0]
         log_info(f"Built {num_cams} camera tensors ({train_W}x{train_H})")
 
-        num_points = points_xyz.shape[0]
+        # ------------------------------------------------------------------
+        # Gaussian parameter initialisation — resume from checkpoint or fresh
+        # ------------------------------------------------------------------
 
-        # Scales in log-space: optimiser can freely explore without hitting
-        # non-negativity constraint. Initial ~0.01 world units = small isotropic blobs.
-        log_scales = torch.full(
-            (num_points, 3),
-            fill_value=math.log(0.01),
-            dtype=torch.float32,
-            device=torch_device,
-        )
-
-        # Identity quaternions (w=1, xyz=0)
-        quats = torch.zeros(num_points, 4, dtype=torch.float32, device=torch_device)
-        quats[:, 0] = 1.0
-
-        # Opacities in logit-space. logit(0.1) ~ -2.2: start semi-transparent
-        # so the scene builds up gradually rather than starting with opaque blobs.
-        opacities_logit = torch.full(
-            (num_points,),
-            fill_value=-2.2,
-            dtype=torch.float32,
-            device=torch_device,
-        )
-
-        # Spherical harmonics: degree 0 (DC) seeded from COLMAP point colours.
-        # Higher-degree SH added progressively to model view-dependent effects
-        # (specular highlights on LED walls, etc.)
         sh_degree = 3
         num_sh_coeffs = (sh_degree + 1) ** 2  # 16 for degree 3
-        C0 = 0.28209479177387814  # SH DC normalisation constant
-        sh_coeffs = torch.zeros(
-            num_points,
-            num_sh_coeffs,
-            3,
-            dtype=torch.float32,
-            device=torch_device,
-        )
-        sh_coeffs[:, 0, :] = (point_colours - 0.5) / C0
 
-        means = points_xyz.clone().requires_grad_(True)
-        log_scales = log_scales.requires_grad_(True)
-        quats = quats.requires_grad_(True)
-        opacities_logit = opacities_logit.requires_grad_(True)
-        sh_coeffs = sh_coeffs.requires_grad_(True)
+        if self.resume_from is not None:
+            # ---- Resume path: load tensors from checkpoint ----
+            ckpt = self._load_checkpoint(self.resume_from, torch_device)
+            start_iter = int(ckpt["iteration"]) + 1
+
+            # Early-exit if the target is already met
+            if start_iter > self.iterations:
+                log_warning(
+                    f"Checkpoint iteration {ckpt['iteration']:,} already meets or exceeds "
+                    f"the requested target of {self.iterations:,} iterations.\n"
+                    "  Exporting final .ply from checkpoint and skipping training."
+                )
+                final_ply_path = self.models_dir / FINAL_PLY_NAME
+                means_cpu = ckpt["means"].to(torch_device)
+                log_scales_cpu = ckpt["log_scales"].to(torch_device)
+                quats_cpu = ckpt["quats"].to(torch_device)
+                opacities_logit_cpu = ckpt["opacities_logit"].to(torch_device)
+                sh0_cpu = ckpt["sh0"].to(torch_device)
+                shN_cpu = ckpt["shN"].to(torch_device)
+                sh_all = torch.cat([sh0_cpu, shN_cpu], dim=1)
+                self._save_ply(
+                    path=final_ply_path,
+                    means=means_cpu,
+                    log_scales=log_scales_cpu,
+                    quats=quats_cpu,
+                    opacities_logit=opacities_logit_cpu,
+                    sh_coeffs=sh_all,
+                    torch=torch,
+                )
+                return final_ply_path
+
+            means = ckpt["means"].to(torch_device).requires_grad_(True)
+            log_scales = ckpt["log_scales"].to(torch_device).requires_grad_(True)
+            quats = ckpt["quats"].to(torch_device).requires_grad_(True)
+            opacities_logit = (
+                ckpt["opacities_logit"].to(torch_device).requires_grad_(True)
+            )
+            sh0 = ckpt["sh0"].to(torch_device).requires_grad_(True)
+            shN = ckpt["shN"].to(torch_device).requires_grad_(True)
+
+            log_info(
+                f"Resuming from iteration {ckpt['iteration']:,} → "
+                f"training to {self.iterations:,}  "
+                f"({self.iterations - ckpt['iteration']:,} iterations remaining)"
+            )
+
+        else:
+            # ---- Fresh path: initialise from COLMAP sparse point cloud ----
+            start_iter = 1
+            num_points = points_xyz.shape[0]
+
+            # Scales initialised from the average distance to the 3 nearest neighbours,
+            # matching the gsplat simple_trainer.py reference implementation.
+            # A fixed log(0.01) is far too small for most real scenes — Gaussians start as
+            # microscopic dots and require many more densification steps to grow to the
+            # correct size, leaving the scene transparent for most of training.
+            # KNN-based init adapts to actual point cloud density automatically.
+            with torch.no_grad():
+                # Chunked pairwise KNN to keep peak GPU memory bounded.
+                # Peak memory per chunk = chunk_size × N × 3 × 4 bytes.
+                # chunk_size=512, N=255k → ~1.5 GB — safe on an 8 GB GPU.
+                chunk_size = 512
+                dist2_list = []
+                pts = points_xyz  # (N, 3)
+                for start in range(0, num_points, chunk_size):
+                    end = min(start + chunk_size, num_points)
+                    c = end - start  # actual chunk size (≤ chunk_size)
+                    # (c, N, 3) → (c, N) squared distances
+                    diff = pts[start:end, None, :] - pts[None, :, :]  # (c, N, 3)
+                    d2 = (diff**2).sum(-1)  # (c, N)
+                    # Vectorised self-distance masking — no Python loop.
+                    # local_idx[i] = i, global_idx[i] = start + i → masks the diagonal block.
+                    local_idx = torch.arange(c, device=torch_device)
+                    global_idx = torch.arange(start, end, device=torch_device)
+                    d2[local_idx, global_idx] = 1e10
+                    # k=3 nearest neighbours (excluding self)
+                    knn_d2, _ = d2.topk(3, dim=-1, largest=False)  # (c, 3)
+                    dist2_list.append(knn_d2.mean(dim=-1))  # (c,)
+                dist2_avg = torch.cat(dist2_list, dim=0)  # (N,)
+                dist_avg = torch.sqrt(dist2_avg.clamp(min=1e-8))
+                # log-space scales, isotropic initialisation — shape (N, 3)
+                log_scales = torch.log(dist_avg).unsqueeze(-1).repeat(1, 3)
+
+            # Identity quaternions (w=1, xyz=0)
+            quats = torch.zeros(num_points, 4, dtype=torch.float32, device=torch_device)
+            quats[:, 0] = 1.0
+
+            # Opacities in logit-space. logit(0.1) ~ -2.2: start semi-transparent
+            # so the scene builds up gradually rather than starting with opaque blobs.
+            opacities_logit = torch.full(
+                (num_points,),
+                fill_value=-2.2,
+                dtype=torch.float32,
+                device=torch_device,
+            )
+
+            # Spherical harmonics: degree 0 (DC) seeded from COLMAP point colours.
+            # Higher-degree SH added progressively to model view-dependent effects
+            # (specular highlights on LED walls, etc.)
+            C0 = 0.28209479177387814  # SH DC normalisation constant
+            sh_coeffs = torch.zeros(
+                num_points,
+                num_sh_coeffs,
+                3,
+                dtype=torch.float32,
+                device=torch_device,
+            )
+            sh_coeffs[:, 0, :] = (point_colours - 0.5) / C0
+
+            means = points_xyz.clone().requires_grad_(True)
+            log_scales = log_scales.requires_grad_(True)
+            quats = quats.requires_grad_(True)
+            opacities_logit = opacities_logit.requires_grad_(True)
+
+            # Split SH into two separate leaf tensors with different learning rates,
+            # matching the gsplat simple_trainer.py reference (sh0_lr vs shN_lr).
+            # Using a single high LR for all SH coefficients causes the higher-order
+            # view-dependent terms to overfit aggressively, producing noisy colour artifacts.
+            #   sh0 = DC component only  (N, 1, 3)  — trained at DEFAULT_LR_SH0 = 2.5e-3
+            #   shN = higher-order terms (N, 15, 3) — trained at DEFAULT_LR_SHN = 2.5e-3/20
+            # sh_coeffs is used only to seed the values; sh0/shN are the actual parameters.
+            sh0 = sh_coeffs[:, :1, :].detach().requires_grad_(True)  # (N, 1, 3)
+            shN = sh_coeffs[:, 1:, :].detach().requires_grad_(True)  # (N, 15, 3)
+            del sh_coeffs  # no longer needed; sh0 and shN are the live parameters
+
+        # ------------------------------------------------------------------
+        # Shared: optimizer, grad accumulators, image loading
+        # ------------------------------------------------------------------
+
+        num_points = means.shape[0]
 
         optimizer = torch.optim.Adam(
             [
@@ -938,13 +1155,18 @@ class GsplatTrainer(BaseTrainer):
                     "lr": DEFAULT_LR_OPACITIES,
                     "name": "opacities",
                 },
-                {"params": [sh_coeffs], "lr": DEFAULT_LR_SH, "name": "sh"},
+                {"params": [sh0], "lr": DEFAULT_LR_SH0, "name": "sh0"},
+                {"params": [shN], "lr": DEFAULT_LR_SHN, "name": "shN"},
             ],
             eps=1e-15,
         )
 
         grad_accum = torch.zeros(num_points, device=torch_device)
         grad_count = torch.zeros(num_points, device=torch_device, dtype=torch.int32)
+
+        # Helper to reassemble sh_coeffs from sh0 + shN for rasterization and saving.
+        def get_sh_coeffs():
+            return torch.cat([sh0, shN], dim=1)  # (N, 16, 3)
 
         log_info("Loading training images...")
         train_images: list = []
@@ -991,10 +1213,11 @@ class GsplatTrainer(BaseTrainer):
         final_ply_path = self.models_dir / FINAL_PLY_NAME
         active_sh_degree = 0
 
+        remaining = self.iterations - start_iter + 1
         pbar = make_progress(
-            range(1, self.iterations + 1),
+            range(start_iter, self.iterations + 1),
             desc="Training",
-            total=self.iterations,
+            total=remaining,
             unit="iter",
         )
 
@@ -1008,11 +1231,23 @@ class GsplatTrainer(BaseTrainer):
 
             w2c = torch.inverse(c2w)
             scales = torch.exp(log_scales)
+            # gsplat normalises quats internally; pre-normalising is harmless but
+            # we keep it for numerical safety on freshly-cloned/split Gaussians.
             quats_norm = torch.nn.functional.normalize(quats, dim=-1)
             opacities = torch.sigmoid(opacities_logit)
-            num_active = (active_sh_degree + 1) ** 2
-            active_sh = sh_coeffs[:, :num_active, :]
 
+            # Assemble active SH slice from the two separate param groups.
+            # sh0 = DC (1 coeff), shN = higher-order (15 coeffs for degree 3).
+            # We only pass the coefficients up to the active degree to the rasterizer.
+            num_active = (active_sh_degree + 1) ** 2
+            all_sh = get_sh_coeffs()  # (N, 16, 3) — reassembled each iter
+            active_sh = all_sh[:, :num_active, :]
+
+            # absgrad=True: accumulate the absolute value of the 2D positional gradient
+            # rather than the signed gradient. Without this, positive and negative
+            # gradient contributions cancel out in the accumulation buffer, causing
+            # densification to undercount high-gradient regions and under-densify.
+            # The gsplat simple_trainer.py reference uses absgrad=True via DefaultStrategy.
             try:
                 render_colors, render_alphas, info = gsplat.rasterization(
                     means=means,
@@ -1028,8 +1263,10 @@ class GsplatTrainer(BaseTrainer):
                     near_plane=0.01,
                     far_plane=1000.0,
                     render_mode="RGB",
+                    absgrad=True,
                 )
             except TypeError:
+                # Older gsplat versions don't have absgrad — fall back gracefully.
                 render_colors, render_alphas, info = gsplat.rasterization(
                     means=means,
                     quats=quats_norm,
@@ -1046,16 +1283,32 @@ class GsplatTrainer(BaseTrainer):
             rendered = render_colors[0]  # (H, W, 3)
             loss = torch.abs(rendered - gt_image).mean()
 
-            optimizer.zero_grad(set_to_none=True)
+            # retain_grad() must be called on means2d BEFORE loss.backward().
+            # means2d is a non-leaf intermediate tensor produced inside the gsplat
+            # CUDA kernel — PyTorch does not populate .grad on non-leaf tensors
+            # unless explicitly asked. Without this call, .grad is always None,
+            # grad_accum is never updated, and densification (clone/split) never
+            # fires — leaving the scene permanently sparse and transparent.
+            if DENSIFY_FROM_ITER <= iteration <= DENSIFY_UNTIL_ITER:
+                if info.get("means2d") is not None:
+                    info["means2d"].retain_grad()
+
             loss.backward()
 
+            # Read the 2D positional gradients AFTER backward() has populated them.
             if DENSIFY_FROM_ITER <= iteration <= DENSIFY_UNTIL_ITER:
                 if info.get("means2d") is not None and info["means2d"].grad is not None:
-                    grad_mag = info["means2d"].grad[0].norm(dim=-1)
+                    # info["means2d"] shape: (1, N, 2) — batch dim first, so index [0]
+                    grad_mag = info["means2d"].grad[0].norm(dim=-1)  # (N,)
                     grad_accum += grad_mag.detach()
                     grad_count += 1
 
+            # zero_grad AFTER step, matching the gsplat simple_trainer.py reference.
+            # Calling zero_grad before backward is also correct, but the reference
+            # pattern (step → zero_grad) avoids any risk of clearing retained grads
+            # before they are read.
             optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
 
             if (
                 DENSIFY_FROM_ITER <= iteration <= DENSIFY_UNTIL_ITER
@@ -1066,7 +1319,8 @@ class GsplatTrainer(BaseTrainer):
                     log_scales,
                     quats,
                     opacities_logit,
-                    sh_coeffs,
+                    sh0,
+                    shN,
                     grad_accum,
                     grad_count,
                     optimizer,
@@ -1075,7 +1329,8 @@ class GsplatTrainer(BaseTrainer):
                     log_scales=log_scales,
                     quats=quats,
                     opacities_logit=opacities_logit,
-                    sh_coeffs=sh_coeffs,
+                    sh0=sh0,
+                    shN=shN,
                     grad_accum=grad_accum,
                     grad_count=grad_count,
                     optimizer=optimizer,
@@ -1083,7 +1338,12 @@ class GsplatTrainer(BaseTrainer):
                     torch=torch,
                 )
 
-            if iteration % OPACITY_RESET_EVERY == 0:
+                # Rebuild the get_sh_coeffs closure after densification since
+                # sh0 and shN are new tensors with a different N.
+                def get_sh_coeffs():
+                    return torch.cat([sh0, shN], dim=1)
+
+            if iteration % OPACITY_RESET_EVERY == 0 and iteration < self.iterations:
                 with torch.no_grad():
                     opacities_logit.fill_(-4.6)
                 log_info(f"[iter {iteration}] Opacity reset")
@@ -1097,7 +1357,10 @@ class GsplatTrainer(BaseTrainer):
                         "log_scales": log_scales.detach().cpu(),
                         "quats": quats.detach().cpu(),
                         "opacities_logit": opacities_logit.detach().cpu(),
-                        "sh_coeffs": sh_coeffs.detach().cpu(),
+                        # Save sh0 and shN separately so checkpoints can be reloaded
+                        # with the correct per-group learning rates.
+                        "sh0": sh0.detach().cpu(),
+                        "shN": shN.detach().cpu(),
                         "loss": loss.item(),
                     },
                     str(ckpt_path),
@@ -1121,7 +1384,7 @@ class GsplatTrainer(BaseTrainer):
             log_scales=log_scales,
             quats=quats,
             opacities_logit=opacities_logit,
-            sh_coeffs=sh_coeffs,
+            sh_coeffs=get_sh_coeffs(),  # reassemble sh0 + shN → (N, 16, 3)
             torch=torch,
         )
         log_success(f"Final model saved: {final_ply_path}")
@@ -1133,7 +1396,8 @@ class GsplatTrainer(BaseTrainer):
         log_scales,
         quats,
         opacities_logit,
-        sh_coeffs,
+        sh0,
+        shN,
         grad_accum,
         grad_count,
         optimizer,
@@ -1148,6 +1412,9 @@ class GsplatTrainer(BaseTrainer):
           - Split: replace large Gaussians with two smaller ones at high-gradient regions
             (over-reconstructed coarse areas — e.g. large background panels)
           - Prune: remove nearly-transparent Gaussians (opacity < threshold)
+
+        sh0 and shN are kept as separate tensors so their different learning rates
+        are preserved when the optimizer is rebuilt after each densification step.
 
         Returns updated parameter tensors and a fresh optimizer with the new N.
         """
@@ -1177,9 +1444,8 @@ class GsplatTrainer(BaseTrainer):
                 opacities_logit = torch.cat(
                     [opacities_logit, opacities_logit[clone_mask].detach()], dim=0
                 )
-                sh_coeffs = torch.cat(
-                    [sh_coeffs, sh_coeffs[clone_mask].detach()], dim=0
-                )
+                sh0 = torch.cat([sh0, sh0[clone_mask].detach()], dim=0)
+                shN = torch.cat([shN, shN[clone_mask].detach()], dim=0)
 
             # Split: replace large Gaussians with two smaller ones
             if split_mask.any():
@@ -1205,10 +1471,8 @@ class GsplatTrainer(BaseTrainer):
                     ],
                     dim=0,
                 )
-                sh_coeffs = torch.cat(
-                    [sh_coeffs[keep], sh_coeffs[split_mask], sh_coeffs[split_mask]],
-                    dim=0,
-                )
+                sh0 = torch.cat([sh0[keep], sh0[split_mask], sh0[split_mask]], dim=0)
+                shN = torch.cat([shN[keep], shN[split_mask], shN[split_mask]], dim=0)
 
             # Prune: remove nearly-transparent Gaussians
             opacities = torch.sigmoid(opacities_logit)
@@ -1219,18 +1483,23 @@ class GsplatTrainer(BaseTrainer):
                 log_scales = log_scales[keep]
                 quats = quats[keep]
                 opacities_logit = opacities_logit[keep]
-                sh_coeffs = sh_coeffs[keep]
+                sh0 = sh0[keep]
+                shN = shN[keep]
 
             new_n = means.shape[0]
             grad_accum = torch.zeros(new_n, device=torch_device)
             grad_count = torch.zeros(new_n, device=torch_device, dtype=torch.int32)
 
-        # Re-attach requires_grad and rebuild optimizer with new tensors
+        # Re-attach requires_grad and rebuild optimizer with new tensors.
+        # sh0 and shN get their own param groups with different LRs — this is
+        # critical: shN must train at 20× lower LR than sh0 to avoid overfitting
+        # the view-dependent colour terms.
         means = means.detach().requires_grad_(True)
         log_scales = log_scales.detach().requires_grad_(True)
         quats = quats.detach().requires_grad_(True)
         opacities_logit = opacities_logit.detach().requires_grad_(True)
-        sh_coeffs = sh_coeffs.detach().requires_grad_(True)
+        sh0 = sh0.detach().requires_grad_(True)
+        shN = shN.detach().requires_grad_(True)
 
         optimizer = torch.optim.Adam(
             [
@@ -1242,7 +1511,8 @@ class GsplatTrainer(BaseTrainer):
                     "lr": DEFAULT_LR_OPACITIES,
                     "name": "opacities",
                 },
-                {"params": [sh_coeffs], "lr": DEFAULT_LR_SH, "name": "sh"},
+                {"params": [sh0], "lr": DEFAULT_LR_SH0, "name": "sh0"},
+                {"params": [shN], "lr": DEFAULT_LR_SHN, "name": "shN"},
             ],
             eps=1e-15,
         )
@@ -1252,7 +1522,8 @@ class GsplatTrainer(BaseTrainer):
             log_scales,
             quats,
             opacities_logit,
-            sh_coeffs,
+            sh0,
+            shN,
             grad_accum,
             grad_count,
             optimizer,
@@ -1298,9 +1569,26 @@ class GsplatTrainer(BaseTrainer):
         n = xyz.shape[0]
         num_sh = sh.shape[1]
 
-        f_dc = sh[:, 0, :]  # (N, 3) DC SH coefficients
+        f_dc = sh[
+            :, 0, :
+        ]  # (N, 3) DC SH coefficients — layout: [N, rgb], correct as-is
+
+        # Higher-order SH coefficients must be stored in CHANNEL-MAJOR order to match
+        # the Inria 3DGS PLY spec that all standard viewers (SuperSplat, Antimatter15,
+        # Luma) parse:
+        #
+        #   f_rest = [c1_R, c2_R, ..., c15_R,  c1_G, c2_G, ..., c15_G,  c1_B, ...]
+        #
+        # sh[:, 1:, :] has shape (N, 15, 3) — axis 1 = coeff index, axis 2 = RGB channel.
+        # A naive .reshape(n, -1) would flatten in C-order (coefficient-major):
+        #   [c1_R, c1_G, c1_B,  c2_R, c2_G, c2_B, ...]  ← WRONG: interleaved channels
+        #
+        # .transpose(0, 2, 1) swaps axes 1 and 2 → shape (N, 3, 15), so the subsequent
+        # .reshape(n, -1) flattens in channel-major order → correct Inria layout.
+        # Without this transpose the R/G/B SH basis functions are applied to the wrong
+        # color channels, producing the characteristic iridescent "oily" rainbow artifact.
         f_rest = (
-            sh[:, 1:, :].reshape(n, -1)
+            sh[:, 1:, :].transpose(0, 2, 1).reshape(n, -1)
             if num_sh > 1
             else np.zeros((n, 0), dtype=np.float32)
         )
@@ -1404,11 +1692,14 @@ def run_training(
     backend: str = "gsplat",
     iterations: int = 15_000,
     preview_every: int = 500,
+    resume: bool = False,
+    resume_from: Optional[Path] = None,
+    restart: bool = False,
 ) -> None:
     """Entry point for the gsforge train CLI command.
 
-    Loads the project, runs training with the specified backend, updates
-    project.json, and prints a summary table.
+    Loads the project, resolves resume/restart logic, runs training with the
+    specified backend, updates project.json, and prints a summary table.
 
     Parameters
     ----------
@@ -1420,22 +1711,98 @@ def run_training(
         Total number of training iterations.
     preview_every : int
         Save a preview render every N iterations.
+    resume : bool
+        If True, resume from the latest checkpoint (explicit flag).
+    resume_from : Optional[Path]
+        If set, resume from this specific checkpoint file.
+    restart : bool
+        If True, force a fresh start from COLMAP even if checkpoints exist.
+        Takes precedence over ``resume`` and ``resume_from``.
+
+    Resume precedence (highest → lowest):
+      1. ``restart=True``  → always start fresh from COLMAP
+      2. ``resume_from``   → resume from the specified checkpoint
+      3. ``resume=True``   → resume from the latest checkpoint
+      4. smart auto-resume → resume if project.json says training completed
+                             and a checkpoint exists
+      5. fallback          → start fresh from COLMAP
     """
     from gsforge.project import GSProject
 
     proj = GSProject.from_path(project_path)
 
+    # ------------------------------------------------------------------
+    # Resolve which checkpoint to use (if any)
+    # ------------------------------------------------------------------
+    resolved_checkpoint: Optional[Path] = None
+
+    if restart:
+        # Explicit forced restart — ignore all checkpoints
+        log_info(
+            "Forced restart: starting fresh from COLMAP (--restart / --no-resume)."
+        )
+        resolved_checkpoint = None
+
+    elif resume_from is not None:
+        # Explicit checkpoint path provided
+        if not resume_from.is_absolute():
+            # Resolve relative paths against the checkpoints directory
+            candidate = proj.checkpoints_dir / resume_from
+            if candidate.exists():
+                resume_from = candidate
+            elif not resume_from.exists():
+                log_error(
+                    f"Checkpoint not found: {resume_from}\n"
+                    f"  Also tried: {candidate}\n"
+                    "  Use --restart to start fresh from COLMAP."
+                )
+        resolved_checkpoint = resume_from
+        log_info(f"Explicit checkpoint: resuming from {resume_from.name}")
+
+    elif resume:
+        # Bare --resume: use latest checkpoint
+        latest = proj.get_latest_checkpoint()
+        if latest is None:
+            log_warning(
+                "No checkpoints found in models/checkpoints/ — "
+                "falling back to fresh COLMAP initialisation."
+            )
+            resolved_checkpoint = None
+        else:
+            resolved_checkpoint = latest
+            log_info(f"--resume: using latest checkpoint {latest.name}")
+
+    else:
+        # Smart auto-resume: trigger only when project.json says training completed
+        # and a matching checkpoint exists.
+        if proj.should_resume():
+            latest = proj.get_latest_checkpoint()
+            resolved_checkpoint = latest
+            log_info(
+                f"Auto-resuming from iteration {proj.meta.last_iteration:,} "
+                f"({latest.name if latest else '?'}) — "
+                "use --restart to start fresh from COLMAP."
+            )
+        else:
+            log_info("Starting fresh from COLMAP (no prior completed training found).")
+            resolved_checkpoint = None
+
+    # ------------------------------------------------------------------
+    # Build trainer and run
+    # ------------------------------------------------------------------
     TrainerClass = get_trainer(backend)
     trainer = TrainerClass(
         project=proj,
         iterations=iterations,
         preview_every=preview_every,
+        resume_from=resolved_checkpoint,
     )
 
     try:
         result = trainer.train()
     except (FileNotFoundError, ValueError, ImportError) as exc:
-        # User-facing errors: print clearly and mark training as failed
+        # User-facing errors: print clearly and mark training as failed.
+        # Do NOT wipe existing final_ply / last_iteration on failure.
         log_error(str(exc))
         proj.update_after_training(training_status="failed")
         return
@@ -1468,6 +1835,12 @@ def run_training(
         else f"{mins}m {secs}s" if mins else f"{secs}s"
     )
 
+    resume_note = (
+        f"Resumed from {resolved_checkpoint.name}"
+        if resolved_checkpoint
+        else "Fresh start"
+    )
+
     print_summary_table(
         title="[bold cyan]Training complete[/bold cyan]",
         rows=[
@@ -1475,6 +1848,7 @@ def run_training(
             ("Final output", final_ply_rel),
             ("Device", result.device.upper()),
             ("Duration", duration_str),
+            ("Mode", resume_note),
             ("Checkpoints", str(proj.models_dir / CHECKPOINTS_SUBDIR)),
             ("Previews", str(proj.renders_dir)),
         ],

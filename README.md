@@ -41,7 +41,7 @@ gsforge requires **PyTorch 2.4** with CUDA support. Install it **before** instal
 
 ```bash
 # CUDA 12.4 (required for the gsplat precompiled wheels)
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
+pip install torch==2.4.1 torchvision==0.19.1 torchaudio==2.4.1 --index-url https://download.pytorch.org/whl/cu124
 ```
 
 ### 3. Install the NVIDIA CUDA Toolkit
@@ -87,6 +87,14 @@ python -c "import torch; print('CUDA available:', torch.cuda.is_available())"
 ### 4. Install gsplat
 
 gsplat provides the CUDA-accelerated 3DGS rasteriser used for training:
+
+Before installing gsplat (latest version with wheel tailored to our conda environment), make sure we have the following installed.
+
+```bash
+pip install ninja jaxtyping rich
+```
+
+Then we can install gsplat.
 
 ```bash
 pip install gsplat --index-url https://docs.gsplat.studio/whl/pt24cu124
