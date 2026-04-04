@@ -1,5 +1,5 @@
 """
-src/ingest.py — Video frame extraction with VP-tuned smart downsampling.
+gsforge/ingest.py — Video frame extraction with VP-tuned smart downsampling.
 
 Why smart downsampling matters for VP workflows
 -----------------------------------------------
@@ -236,49 +236,19 @@ def compute_frame_interval(
 def _build_ffmpeg_command(
     video_path: Path,
     output_pattern: Path,
-    interval_frames: float,
+    effective_fps: float,  # Pass the calculated FPS here
     downscale: int,
     width: int,
     height: int,
 ) -> list[str]:
-    """Build the FFmpeg command list for frame extraction.
-
-    We use the subprocess API directly (not ffmpeg-python's .run()) because
-    we want to stream stderr for progress reporting and have full control over
-    the select filter expression.
-
-    Parameters
-    ----------
-    video_path:
-        Source video file.
-    output_pattern:
-        Output path pattern, e.g. ``preprocess/frame_%06d.png``.
-    interval_frames:
-        Keep 1 frame every N source frames (float — FFmpeg handles non-integer).
-    downscale:
-        Spatial downscale factor (1 = no downscale).
-    width, height:
-        Native video resolution (used to compute scaled output size).
-
-    Returns
-    -------
-    list[str]
-        The full FFmpeg command as a list of strings.
-    """
-    # Build the video filter chain
     filters: list[str] = []
 
-    # Frame selection: ``not(mod(n, interval))`` keeps frame 0, interval, 2*interval, …
-    # We round interval to 2 decimal places to avoid floating-point noise in the
-    # filter expression string.
-    interval_rounded = round(interval_frames, 2)
-    filters.append(f"select='not(mod(n,{interval_rounded}))'")
+    # Use the 'fps' filter. It handles all the 'mod' math for you
+    # and ensures frames are picked at even time intervals.
+    filters.append(f"fps={round(effective_fps, 4)}")
 
-    # Spatial downscale — use lanczos for best quality at reduced resolution.
-    # We compute the output size explicitly so it's always divisible by 2
-    # (required by some codecs, and good practice for COLMAP).
     if downscale > 1:
-        out_w = (width // downscale) & ~1  # round down to nearest even number
+        out_w = (width // downscale) & ~1
         out_h = (height // downscale) & ~1
         filters.append(f"scale={out_w}:{out_h}:flags=lanczos")
 
@@ -286,20 +256,17 @@ def _build_ffmpeg_command(
 
     cmd = [
         "ffmpeg",
-        "-y",  # overwrite output files without asking
+        "-y",
         "-i",
-        str(video_path),  # input file
+        str(video_path),
         "-vf",
-        vf,  # video filter chain
-        "-vsync",
-        "vfr",  # variable frame rate — required with select filter
+        vf,
         "-q:v",
-        "1",  # highest quality for PNG (lossless anyway)
+        "1",
         "-start_number",
-        "1",  # start frame numbering at 1
-        str(output_pattern),  # output pattern: frame_%06d.png
+        "1",
+        str(output_pattern),
     ]
-
     return cmd
 
 
@@ -476,7 +443,7 @@ def extract_frames(
     cmd = _build_ffmpeg_command(
         video_path=video_path,
         output_pattern=output_pattern,
-        interval_frames=interval_frames,
+        effective_fps=native_fps / interval_frames,
         downscale=downscale,
         width=width,
         height=height,

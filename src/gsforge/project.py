@@ -1,5 +1,5 @@
 """
-src/project.py — GSProject: the "smart folder" at the heart of gsforge.
+gsforge/project.py — GSProject: the "smart folder" at the heart of gsforge.
 
 A gsforge project is simply a directory named ``Something.gsproject/``
 containing a ``project.json`` metadata file and a set of canonical
@@ -325,7 +325,7 @@ class GSProject:
     ) -> None:
         """Record ingest results in project.json.
 
-        Called by ``src/ingest.py`` after frame extraction completes.
+        Called by ``gsforge/ingest.py`` after frame extraction completes.
         """
         self.meta.input_type = input_type
         self.meta.input_path = input_path
@@ -345,7 +345,7 @@ class GSProject:
     ) -> None:
         """Record SfM results in project.json.
 
-        Called by ``src/sfm.py`` after reconstruction completes (or fails).
+        Called by ``gsforge/sfm.py`` after reconstruction completes (or fails).
         """
         self.meta.sfm_method = sfm_method
         self.meta.sfm_status = sfm_status
@@ -362,7 +362,7 @@ class GSProject:
     ) -> None:
         """Record training results in project.json.
 
-        Called by ``src/train.py`` after training completes (or fails).
+        Called by ``gsforge/train.py`` after training completes (or fails).
         """
         self.meta.training_status = training_status
         if final_ply is not None:

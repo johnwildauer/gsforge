@@ -1,5 +1,5 @@
 """
-src/sfm.py — Structure-from-Motion runner for gsforge.
+gsforge/sfm.py — Structure-from-Motion runner for gsforge.
 
 Why GLOMAP by default?
 ----------------------
@@ -242,9 +242,9 @@ def run_feature_extraction(
             # Use GPU for feature extraction if available — dramatically faster
             "--ImageReader.single_camera",
             "1",  # assume single camera (typical for VP)
-            "--SiftExtraction.use_gpu",
+            "--FeatureExtraction.use_gpu",
             "1",
-            "--SiftExtraction.gpu_index",
+            "--FeatureExtraction.gpu_index",
             "-1",  # auto-select GPU
         ],
         step_name="feature_extractor",
@@ -289,9 +289,9 @@ def run_feature_matching(
                 "10",  # match each frame to ±10 neighbours
                 "--SequentialMatching.loop_detection",
                 "0",  # no loop closure needed for VP
-                "--SiftMatching.use_gpu",
+                "--FeatureMatching.use_gpu",
                 "1",
-                "--SiftMatching.gpu_index",
+                "--FeatureMatching.gpu_index",
                 "-1",
             ],
             step_name="sequential_matcher",
@@ -304,9 +304,9 @@ def run_feature_matching(
             [
                 "--database_path",
                 str(database_path),
-                "--SiftMatching.use_gpu",
+                "--FeatureMatching.use_gpu",
                 "1",
-                "--SiftMatching.gpu_index",
+                "--FeatureMatching.gpu_index",
                 "-1",
             ],
             step_name="exhaustive_matcher",
@@ -357,8 +357,8 @@ def run_mapper(
     # GLOMAP flag — only available in COLMAP 4.x
     # If the user has COLMAP 3.x and chose glomap, COLMAP will error with a
     # clear message about the unknown flag.
-    if method == "glomap":
-        args += ["--Mapper.mapper_type", "GLOBAL"]
+    # if method == "glomap":
+    #     args += ["--Mapper.mapper_type", "GLOBAL"]
 
     _run_colmap_step(
         colmap_bin,

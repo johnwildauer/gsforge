@@ -3,7 +3,7 @@ cli.py — Main Typer CLI entrypoint for gsforge.
 
 All user-facing commands live here.  Each command is a thin wrapper that:
   1. Resolves the project path.
-  2. Delegates to the appropriate src/ module.
+  2. Delegates to the appropriate gsforge/ module.
   3. Prints a Rich summary table on success.
 
 Command reference
@@ -192,7 +192,7 @@ def ingest(
         gsforge ingest --video footage.mp4 --downscale 2
     """
     from gsforge.project import GSProject
-    from src import ingest as ingest_module
+    from gsforge import ingest as ingest_module
 
     proj = GSProject.from_path(resolve_project_path(project))
 
@@ -263,7 +263,7 @@ def import_colmap(
         gsforge import-colmap --source /path/to/sparse/0
     """
     from gsforge.project import GSProject
-    from src import sfm as sfm_module
+    from gsforge import sfm as sfm_module
 
     proj = GSProject.from_path(resolve_project_path(project))
 
@@ -326,7 +326,7 @@ def sfm(
         gsforge sfm --method colmap
     """
     from gsforge.project import GSProject
-    from src import sfm as sfm_module
+    from gsforge import sfm as sfm_module
 
     if method not in ("glomap", "colmap"):
         log_error(f"Unknown SfM method: {method!r}. Choose 'glomap' or 'colmap'.")
@@ -397,7 +397,7 @@ def export_colmap(
         gsforge export-colmap --output /mnt/exports/MyScene_colmap
     """
     from gsforge.project import GSProject
-    from src import sfm as sfm_module
+    from gsforge import sfm as sfm_module
 
     proj = GSProject.from_path(resolve_project_path(project))
     proj.require_sfm_done()
@@ -470,13 +470,7 @@ def train(
         gsforge train --iterations 30000 --preview-every 1000
     """
     from gsforge.project import GSProject
-
-    if backend != "gsplat":
-        log_error(
-            f"Unknown training backend: {backend!r}.\n"
-            "  Currently only 'gsplat' is supported. "
-            "Brush and Inria backends are planned for a future release."
-        )
+    from gsforge import train as train_module
 
     proj = GSProject.from_path(resolve_project_path(project))
     proj.require_sfm_done()
@@ -486,11 +480,11 @@ def train(
         f"backend={backend}  iterations={iterations}  preview_every={preview_every}",
     )
 
-    # train.py is generated in the next iteration — stub with a clear message
-    log_warning(
-        "src/train.py is not yet implemented.\n"
-        "  This command will be fully functional in the next gsforge release.\n"
-        "  SfM output is ready at: " + str(proj.sparse_dir)
+    train_module.run_training(
+        project_path=proj.root,
+        backend=backend,
+        iterations=iterations,
+        preview_every=preview_every,
     )
 
 
@@ -570,8 +564,8 @@ def run_all(
         gsforge run-all --video footage.mp4 --method colmap --iterations 30000
     """
     from gsforge.project import GSProject
-    from src import ingest as ingest_module
-    from src import sfm as sfm_module
+    from gsforge import ingest as ingest_module
+    from gsforge import sfm as sfm_module
 
     print_panel(
         title="gsforge run-all",
@@ -603,11 +597,15 @@ def run_all(
     sfm_result = sfm_module.run_sfm(project=proj, method=method)  # type: ignore[arg-type]
     log_success(f"SfM done — {sfm_result.camera_count} cameras registered.")
 
-    # --- Step 3: Train (stub until train.py is implemented) ---
+    # --- Step 3: Train ---
     log_step("Step 3/3 — train")
-    log_warning(
-        "src/train.py is not yet implemented — skipping training step.\n"
-        "  Run [bold]gsforge train[/bold] once it is available."
+    from gsforge import train as train_module
+
+    train_module.run_training(
+        project_path=proj.root,
+        backend="gsplat",
+        iterations=iterations,
+        preview_every=DEFAULT_PREVIEW_EVERY,
     )
 
     print_summary_table(
@@ -616,7 +614,7 @@ def run_all(
             ("Frames extracted", str(result.num_frames)),
             ("Cameras registered", str(sfm_result.camera_count)),
             ("SfM model", str(proj.sparse_dir)),
-            ("Training", "pending (train.py not yet implemented)"),
+            ("Final PLY", str(proj.models_dir / "final_scene.ply")),
         ],
     )
 

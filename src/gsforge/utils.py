@@ -1,5 +1,5 @@
 """
-src/utils.py — Shared utilities for gsforge.
+gsforge/utils.py — Shared utilities for gsforge.
 
 Covers:
   - Rich-based console logging (info, success, warning, error)
