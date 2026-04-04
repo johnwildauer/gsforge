@@ -35,7 +35,7 @@ from typing import Optional
 import typer
 from rich.console import Console
 
-from src.utils import (
+from gsforge.utils import (
     DEFAULT_MAX_FRAMES,
     DEFAULT_SFM_METHOD,
     DEFAULT_TARGET_FPS,
@@ -105,7 +105,7 @@ def init_project(
         gsforge init-project --name MyVPScene
         gsforge init-project --name MyVPScene --project /mnt/projects
     """
-    from src.project import GSProject
+    from gsforge.project import GSProject
 
     parent = project or Path.cwd()
     if not parent.exists():
@@ -191,7 +191,7 @@ def ingest(
         gsforge ingest --video footage.mp4 --target-fps 3 --max-frames 300
         gsforge ingest --video footage.mp4 --downscale 2
     """
-    from src.project import GSProject
+    from gsforge.project import GSProject
     from src import ingest as ingest_module
 
     proj = GSProject.from_path(resolve_project_path(project))
@@ -262,7 +262,7 @@ def import_colmap(
     Example:
         gsforge import-colmap --source /path/to/sparse/0
     """
-    from src.project import GSProject
+    from gsforge.project import GSProject
     from src import sfm as sfm_module
 
     proj = GSProject.from_path(resolve_project_path(project))
@@ -325,7 +325,7 @@ def sfm(
         gsforge sfm
         gsforge sfm --method colmap
     """
-    from src.project import GSProject
+    from gsforge.project import GSProject
     from src import sfm as sfm_module
 
     if method not in ("glomap", "colmap"):
@@ -396,7 +396,7 @@ def export_colmap(
         gsforge export-colmap
         gsforge export-colmap --output /mnt/exports/MyScene_colmap
     """
-    from src.project import GSProject
+    from gsforge.project import GSProject
     from src import sfm as sfm_module
 
     proj = GSProject.from_path(resolve_project_path(project))
@@ -469,7 +469,7 @@ def train(
         gsforge train
         gsforge train --iterations 30000 --preview-every 1000
     """
-    from src.project import GSProject
+    from gsforge.project import GSProject
 
     if backend != "gsplat":
         log_error(
@@ -521,7 +521,7 @@ def info(
         gsforge info
         gsforge info --project /mnt/projects/MyScene.gsproject
     """
-    from src.project import GSProject
+    from gsforge.project import GSProject
 
     proj = GSProject.from_path(resolve_project_path(project))
     proj.print_info()
@@ -569,7 +569,7 @@ def run_all(
         gsforge run-all --video footage.mp4
         gsforge run-all --video footage.mp4 --method colmap --iterations 30000
     """
-    from src.project import GSProject
+    from gsforge.project import GSProject
     from src import ingest as ingest_module
     from src import sfm as sfm_module
 

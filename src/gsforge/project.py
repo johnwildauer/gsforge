@@ -33,7 +33,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal, Optional
 
-from src.utils import (
+from gsforge.utils import (
     PROJECT_FILENAME,
     SUBFOLDERS,
     console,

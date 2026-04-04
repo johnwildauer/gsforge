@@ -55,7 +55,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, Optional
 
-from src.utils import (
+from gsforge.utils import (
     console,
     ensure_dir,
     log_error,
@@ -110,7 +110,11 @@ def find_colmap_binary() -> Path:
     """
     # Project-local bin/ directory (portable studio installs)
     local_bin = Path("bin")
-    for candidate in [local_bin / "colmap.exe", local_bin / "colmap"]:
+    for candidate in [
+        local_bin / "colmap-x64-windows-cuda" / "bin" / "colmap.exe",
+        local_bin / "colmap.exe",
+        local_bin / "colmap",
+    ]:
         if candidate.exists():
             log_info(f"Using project-local COLMAP: {candidate.resolve()}")
             return candidate.resolve()
@@ -446,7 +450,7 @@ def run_sfm(
     SfmResult
         Summary for the CLI summary table.
     """
-    from src.project import GSProject
+    from gsforge.project import GSProject
 
     # Validate preconditions
     project.require_ingest_done()
@@ -551,7 +555,7 @@ def import_colmap_reconstruction(
     int
         Number of cameras in the imported reconstruction.
     """
-    from src.project import GSProject
+    from gsforge.project import GSProject
 
     source_path = source_path.resolve()
 
@@ -644,7 +648,7 @@ def export_colmap(
     output_path:
         Destination directory for the export.
     """
-    from src.project import GSProject
+    from gsforge.project import GSProject
 
     project.require_sfm_done()
 

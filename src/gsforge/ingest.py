@@ -41,7 +41,7 @@ from typing import Optional
 
 import ffmpeg  # ffmpeg-python bindings
 
-from src.utils import (
+from gsforge.utils import (
     DEFAULT_DOWNSCALE,
     DEFAULT_MAX_FRAMES,
     DEFAULT_TARGET_FPS,
@@ -412,7 +412,7 @@ def extract_frames(
         Summary of the extraction for the CLI summary table.
     """
     # Lazy import to avoid circular dependency (project imports utils, utils doesn't import project)
-    from src.project import GSProject
+    from gsforge.project import GSProject
 
     log_step("Probing video", str(video_path.name))
     duration_s, native_fps, width, height = get_video_info(video_path)

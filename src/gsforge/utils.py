@@ -97,7 +97,7 @@ _THEME = Theme(
 )
 
 #: Module-level console. Import this in other modules:
-#:   from src.utils import console
+#:   from gsforge.utils import console
 console = Console(theme=_THEME, highlight=False)
 
 

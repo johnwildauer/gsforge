@@ -1,6 +1,6 @@
 [build-system]
-requires = ["setuptools>=68", "wheel"]
-build-backend = "setuptools.backends.legacy:build"
+requires = ["setuptools>=68", "wheel", "setuptools-scm"]
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "gsforge"
@@ -60,7 +60,7 @@ dev = [
 
 [project.scripts]
 # This registers the `gsforge` command on the system PATH after `pip install -e .`
-gsforge = "cli:app"
+gsforge = "gsforge.cli:app"
 
 [project.urls]
 Homepage = "https://github.com/your-org/gsforge"
@@ -68,13 +68,11 @@ Repository = "https://github.com/your-org/gsforge"
 Issues = "https://github.com/your-org/gsforge/issues"
 
 [tool.setuptools.packages.find]
-# Tell setuptools to find packages in src/ as well as the root (for cli.py)
-where = ["."]
-include = ["src*"]
+where = ["src"]
+include = ["*"]
 
 [tool.setuptools.package-dir]
-# Map the src package to the src/ directory
-"src" = "src"
+"" = "src"
 
 # ---------------------------------------------------------------------------
 # Ruff — fast linter / formatter (replaces flake8 + isort + black)
