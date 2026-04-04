@@ -23,34 +23,78 @@ gsforge is an open-source, pipeline-oriented tool that takes you from raw VP foo
 
 ### 1. Create a conda environment
 
+If you don't already have `conda` installed, grab either:
+
+- **[Anaconda](https://www.anaconda.com/download)** — full distribution with many pre-installed packages, or
+- **[Miniconda](https://docs.conda.io/en/latest/miniconda.html)** — minimal installer (recommended if you just need `conda`)
+
+Once `conda` is available on your PATH:
+
 ```bash
-conda create -n gsforge python=3.11 -y
+conda create -n gsforge python=3.10 -y
 conda activate gsforge
 ```
 
 ### 2. Install PyTorch with the correct CUDA version
 
-gsforge requires PyTorch with CUDA support. Install it **before** installing gsforge so pip resolves the correct CUDA-enabled wheels:
+gsforge requires **PyTorch 2.4** with CUDA support. Install it **before** installing gsforge so pip resolves the correct CUDA-enabled wheels:
 
 ```bash
-# CUDA 12.1 (recommended for RTX 30xx / 40xx)
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
-
-# CUDA 11.8 (older GPUs)
-# pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
+# CUDA 12.4 (required for the gsplat precompiled wheels)
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
 ```
 
-### 3. Install gsplat
+### 3. Install the NVIDIA CUDA Toolkit
+
+gsplat is a **CUDA-accelerated** library. Without the CUDA Toolkit installed on your system, gsplat will print:
+
+```
+gsplat: No CUDA toolkit found. gsplat will be disabled.
+```
+
+and fall back to a very slow CPU-only mode (hours per training run instead of minutes).
+
+**Windows (VP workstations)**
+
+1. Download **CUDA Toolkit 12.4** from:
+   https://developer.nvidia.com/cuda-12-4-0-download-archive
+   _(Choose: Windows → x86_64 → 11 or 12 → Local)_
+2. Run the installer. Select **Custom install** and ensure **CUDA Toolkit** is checked.
+3. Reboot after installation.
+
+**Linux**
+
+```bash
+# Ubuntu 22.04 example (CUDA 12.4)
+wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.0-1_all.deb
+sudo dpkg -i cuda-keyring_1.0-1_all.deb
+sudo apt update
+sudo apt install cuda-toolkit-12-4
+```
+
+**Verify CUDA is installed**
+
+```bash
+# Should show your GPU and driver version
+nvidia-smi
+
+# Should print: CUDA available: True
+python -c "import torch; print('CUDA available:', torch.cuda.is_available())"
+```
+
+> **CUDA version matching:** The CUDA Toolkit version must match the PyTorch CUDA build you installed in step 2. The gsplat precompiled wheels require **CUDA 12.4** (`cu124`) and **PyTorch 2.4** (`pt24`) — install CUDA Toolkit 12.4 to match.
+
+### 4. Install gsplat
 
 gsplat provides the CUDA-accelerated 3DGS rasteriser used for training:
 
 ```bash
-pip install gsplat
+pip install gsplat --index-url https://docs.gsplat.studio/whl/pt24cu124
 ```
 
-> **Note:** gsplat compiles CUDA extensions on first install. This requires a matching CUDA toolkit. If you hit build errors, see the [gsplat installation guide](https://docs.gsplat.studio/main/installation/installation.html).
+If you see build errors during `pip install gsplat`, it usually means the CUDA Toolkit is missing or the version does not match PyTorch. See the [gsplat installation guide](https://docs.gsplat.studio/main/installation/installation.html) for troubleshooting.
 
-### 4. Install FFmpeg
+### 5. Install FFmpeg
 
 FFmpeg must be on your system PATH.
 
@@ -58,14 +102,14 @@ FFmpeg must be on your system PATH.
 - **Linux**: `sudo apt install ffmpeg`
 - **macOS**: `brew install ffmpeg`
 
-### 5. Install COLMAP 4.x
+### 6. Install COLMAP 4.x
 
 GLOMAP (the default SfM method) requires **COLMAP 4.0 or later**.
 
 - Download from [github.com/colmap/colmap/releases](https://github.com/colmap/colmap/releases)
 - Add the binary to PATH, **or** place it at `./bin/colmap` (or `./bin/colmap.exe` on Windows) for a project-local install.
 
-### 6. Install gsforge
+### 7. Install gsforge
 
 ```bash
 git clone https://github.com/your-org/gsforge.git
