@@ -15,7 +15,6 @@ VP design philosophy: clear errors, fast iteration, safe defaults, interoperabil
 
 from __future__ import annotations
 
-import math
 import struct
 import time
 from abc import ABC, abstractmethod
@@ -59,8 +58,7 @@ DEFAULT_LR_SHN: float = 2.5e-3 / 20  # Higher-order SH — 20× lower than DC, p
 # Using the same high LR for shN causes aggressive
 # view-dependent overfitting → "oily" rainbow artifact.
 
-# Densification schedule.
-# Wait 500 iters for Gaussians to settle before splitting/cloning.
+# Densification schedule
 DENSIFY_FROM_ITER: int = 500
 DENSIFY_EVERY: int = 100
 DENSIFY_UNTIL_ITER: int = 15_000
@@ -693,7 +691,7 @@ def _save_preview_render(render_tensor, output_path: Path) -> None:
 
         img_np = (render_tensor.detach().cpu().clamp(0, 1) * 255).byte().numpy()
         Image.fromarray(img_np, mode="RGB").save(str(output_path))
-        log_info(f"Preview saved: {output_path.name}")
+        log_info(f"\nPreview saved: {output_path.name}")
     except Exception as exc:
         log_warning(f"Could not save preview render: {exc}")
 
@@ -1045,14 +1043,13 @@ class GsplatTrainer(BaseTrainer):
                 )
                 return final_ply_path
 
-            means = ckpt["means"].to(torch_device).requires_grad_(True)
-            log_scales = ckpt["log_scales"].to(torch_device).requires_grad_(True)
-            quats = ckpt["quats"].to(torch_device).requires_grad_(True)
-            opacities_logit = (
-                ckpt["opacities_logit"].to(torch_device).requires_grad_(True)
-            )
-            sh0 = ckpt["sh0"].to(torch_device).requires_grad_(True)
-            shN = ckpt["shN"].to(torch_device).requires_grad_(True)
+            # Load tensors from checkpoint — requires_grad is set by ParameterDict below.
+            means = ckpt["means"].to(torch_device)
+            log_scales = ckpt["log_scales"].to(torch_device)
+            quats = ckpt["quats"].to(torch_device)
+            opacities_logit = ckpt["opacities_logit"].to(torch_device)
+            sh0 = ckpt["sh0"].to(torch_device)
+            shN = ckpt["shN"].to(torch_device)
 
             log_info(
                 f"Resuming from iteration {ckpt['iteration']:,} → "
@@ -1123,50 +1120,88 @@ class GsplatTrainer(BaseTrainer):
             )
             sh_coeffs[:, 0, :] = (point_colours - 0.5) / C0
 
-            means = points_xyz.clone().requires_grad_(True)
-            log_scales = log_scales.requires_grad_(True)
-            quats = quats.requires_grad_(True)
-            opacities_logit = opacities_logit.requires_grad_(True)
+            # Plain tensors — requires_grad is set by ParameterDict below.
+            means = points_xyz.clone()
+            log_scales = log_scales.detach()
+            quats = quats.detach()
+            opacities_logit = opacities_logit.detach()
 
-            # Split SH into two separate leaf tensors with different learning rates,
+            # Split SH into two separate tensors with different learning rates,
             # matching the gsplat simple_trainer.py reference (sh0_lr vs shN_lr).
             # Using a single high LR for all SH coefficients causes the higher-order
             # view-dependent terms to overfit aggressively, producing noisy colour artifacts.
             #   sh0 = DC component only  (N, 1, 3)  — trained at DEFAULT_LR_SH0 = 2.5e-3
             #   shN = higher-order terms (N, 15, 3) — trained at DEFAULT_LR_SHN = 2.5e-3/20
             # sh_coeffs is used only to seed the values; sh0/shN are the actual parameters.
-            sh0 = sh_coeffs[:, :1, :].detach().requires_grad_(True)  # (N, 1, 3)
-            shN = sh_coeffs[:, 1:, :].detach().requires_grad_(True)  # (N, 15, 3)
+            sh0 = sh_coeffs[:, :1, :].detach()  # (N, 1, 3)
+            shN = sh_coeffs[:, 1:, :].detach()  # (N, 15, 3)
             del sh_coeffs  # no longer needed; sh0 and shN are the live parameters
 
         # ------------------------------------------------------------------
-        # Shared: optimizer, grad accumulators, image loading
+        # Shared: ParameterDict + per-param optimizers + DefaultStrategy
         # ------------------------------------------------------------------
+        # DefaultStrategy (from gsplat.strategy) handles all densification:
+        #   - clone/split Gaussians with high 2D positional gradients
+        #   - prune transparent Gaussians
+        #   - periodic opacity reset
+        # It requires parameters wrapped in a ParameterDict and one Adam
+        # optimizer per parameter (so it can surgically update optimizer state
+        # when Gaussians are added/removed without rebuilding from scratch).
 
-        num_points = means.shape[0]
+        try:
+            from gsplat.strategy import DefaultStrategy
+        except ImportError:
+            raise ImportError(
+                "gsplat.strategy.DefaultStrategy not found.\n"
+                "  Upgrade gsplat: pip install --upgrade gsplat\n"
+                "  Minimum required version: 1.0.0"
+            )
 
-        optimizer = torch.optim.Adam(
-            [
-                {"params": [means], "lr": DEFAULT_LR_MEANS, "name": "means"},
-                {"params": [log_scales], "lr": DEFAULT_LR_SCALES, "name": "scales"},
-                {"params": [quats], "lr": DEFAULT_LR_QUATS, "name": "quats"},
-                {
-                    "params": [opacities_logit],
-                    "lr": DEFAULT_LR_OPACITIES,
-                    "name": "opacities",
-                },
-                {"params": [sh0], "lr": DEFAULT_LR_SH0, "name": "sh0"},
-                {"params": [shN], "lr": DEFAULT_LR_SHN, "name": "shN"},
-            ],
-            eps=1e-15,
+        # Wrap parameters in a ParameterDict so DefaultStrategy can mutate them.
+        splats = torch.nn.ParameterDict(
+            {
+                "means": torch.nn.Parameter(means),
+                "scales": torch.nn.Parameter(log_scales),
+                "quats": torch.nn.Parameter(quats),
+                "opacities": torch.nn.Parameter(opacities_logit),
+                "sh0": torch.nn.Parameter(sh0),
+                "shN": torch.nn.Parameter(shN),
+            }
+        ).to(torch_device)
+
+        # One Adam optimizer per parameter — DefaultStrategy needs this so it
+        # can grow/shrink optimizer state (momentum buffers) in sync with the
+        # Gaussian count after each densification step.
+        # The dict keys must exactly match the splats ParameterDict keys so
+        # DefaultStrategy can look up each optimizer by parameter name.
+        optimizers = {
+            name: torch.optim.Adam(
+                [{"params": splats[name], "lr": lr, "name": name}],
+                eps=1e-15,
+            )
+            for name, lr in [
+                ("means", DEFAULT_LR_MEANS),
+                ("scales", DEFAULT_LR_SCALES),
+                ("quats", DEFAULT_LR_QUATS),
+                ("opacities", DEFAULT_LR_OPACITIES),
+                ("sh0", DEFAULT_LR_SH0),
+                ("shN", DEFAULT_LR_SHN),
+            ]
+        }
+
+        # Configure DefaultStrategy to match our densification schedule.
+        strategy = DefaultStrategy(
+            refine_start_iter=DENSIFY_FROM_ITER,
+            refine_stop_iter=DENSIFY_UNTIL_ITER,
+            refine_every=DENSIFY_EVERY,
+            reset_every=OPACITY_RESET_EVERY,
+            prune_opa=OPACITY_PRUNE_THRESHOLD,
+            grow_grad2d=DENSIFY_GRAD_THRESHOLD,
+            absgrad=True,  # use absolute gradients — critical for correct densification
+            verbose=False,
         )
-
-        grad_accum = torch.zeros(num_points, device=torch_device)
-        grad_count = torch.zeros(num_points, device=torch_device, dtype=torch.int32)
-
-        # Helper to reassemble sh_coeffs from sh0 + shN for rasterization and saving.
-        def get_sh_coeffs():
-            return torch.cat([sh0, shN], dim=1)  # (N, 16, 3)
+        strategy.check_sanity(splats, optimizers)
+        strategy_state = strategy.initialize_state(scene_scale=1.0)
 
         log_info("Loading training images...")
         train_images: list = []
@@ -1211,7 +1246,6 @@ class GsplatTrainer(BaseTrainer):
         log_success(f"Loaded {num_train} training images ({train_W}x{train_H})")
 
         final_ply_path = self.models_dir / FINAL_PLY_NAME
-        active_sh_degree = 0
 
         remaining = self.iterations - start_iter + 1
         pbar = make_progress(
@@ -1222,6 +1256,7 @@ class GsplatTrainer(BaseTrainer):
         )
 
         for iteration in pbar:
+            # SH degree schedule: unlock one band every 1000 iterations.
             active_sh_degree = min(sh_degree, iteration // 1000)
 
             cam_idx = random.randint(0, num_train - 1)
@@ -1230,137 +1265,80 @@ class GsplatTrainer(BaseTrainer):
             gt_image = valid_images[cam_idx].to(torch_device)
 
             w2c = torch.inverse(c2w)
-            scales = torch.exp(log_scales)
-            # gsplat normalises quats internally; pre-normalising is harmless but
-            # we keep it for numerical safety on freshly-cloned/split Gaussians.
-            quats_norm = torch.nn.functional.normalize(quats, dim=-1)
-            opacities = torch.sigmoid(opacities_logit)
 
             # Assemble active SH slice from the two separate param groups.
             # sh0 = DC (1 coeff), shN = higher-order (15 coeffs for degree 3).
-            # We only pass the coefficients up to the active degree to the rasterizer.
             num_active = (active_sh_degree + 1) ** 2
-            all_sh = get_sh_coeffs()  # (N, 16, 3) — reassembled each iter
+            all_sh = torch.cat([splats["sh0"], splats["shN"]], dim=1)  # (N, 16, 3)
             active_sh = all_sh[:, :num_active, :]
 
-            # absgrad=True: accumulate the absolute value of the 2D positional gradient
-            # rather than the signed gradient. Without this, positive and negative
-            # gradient contributions cancel out in the accumulation buffer, causing
-            # densification to undercount high-gradient regions and under-densify.
-            # The gsplat simple_trainer.py reference uses absgrad=True via DefaultStrategy.
-            try:
-                render_colors, render_alphas, info = gsplat.rasterization(
-                    means=means,
-                    quats=quats_norm,
-                    scales=scales,
-                    opacities=opacities,
-                    colors=active_sh,
-                    viewmats=w2c.unsqueeze(0),
-                    Ks=K.unsqueeze(0),
-                    width=train_W,
-                    height=train_H,
-                    sh_degree=active_sh_degree,
-                    near_plane=0.01,
-                    far_plane=1000.0,
-                    render_mode="RGB",
-                    absgrad=True,
-                )
-            except TypeError:
-                # Older gsplat versions don't have absgrad — fall back gracefully.
-                render_colors, render_alphas, info = gsplat.rasterization(
-                    means=means,
-                    quats=quats_norm,
-                    scales=scales,
-                    opacities=opacities,
-                    colors=active_sh,
-                    viewmats=w2c.unsqueeze(0),
-                    Ks=K.unsqueeze(0),
-                    width=train_W,
-                    height=train_H,
-                    sh_degree=active_sh_degree,
-                )
+            # Forward pass: rasterize the scene.
+            # absgrad=True is required by DefaultStrategy — it accumulates the
+            # absolute value of the 2D positional gradient for densification.
+            render_colors, render_alphas, info = gsplat.rasterization(
+                means=splats["means"],
+                quats=torch.nn.functional.normalize(splats["quats"], dim=-1),
+                scales=torch.exp(splats["scales"]),
+                opacities=torch.sigmoid(splats["opacities"]),
+                colors=active_sh,
+                viewmats=w2c.unsqueeze(0),
+                Ks=K.unsqueeze(0),
+                width=train_W,
+                height=train_H,
+                sh_degree=active_sh_degree,
+                near_plane=0.01,
+                far_plane=1000.0,
+                render_mode="RGB",
+                absgrad=True,
+            )
 
             rendered = render_colors[0]  # (H, W, 3)
             loss = torch.abs(rendered - gt_image).mean()
 
-            # retain_grad() must be called on means2d BEFORE loss.backward().
-            # means2d is a non-leaf intermediate tensor produced inside the gsplat
-            # CUDA kernel — PyTorch does not populate .grad on non-leaf tensors
-            # unless explicitly asked. Without this call, .grad is always None,
-            # grad_accum is never updated, and densification (clone/split) never
-            # fires — leaving the scene permanently sparse and transparent.
-            if DENSIFY_FROM_ITER <= iteration <= DENSIFY_UNTIL_ITER:
-                if info.get("means2d") is not None:
-                    info["means2d"].retain_grad()
+            # step_pre_backward: called AFTER rasterization but BEFORE loss.backward().
+            # Passes the live `info` dict (which contains means2d) so DefaultStrategy
+            # can call retain_grad() on means2d before backward populates its .grad.
+            # This is the correct order per the gsplat reference implementation.
+            strategy.step_pre_backward(
+                params=splats,
+                optimizers=optimizers,
+                state=strategy_state,
+                step=iteration - 1,  # DefaultStrategy uses 0-based step index
+                info=info,
+            )
 
             loss.backward()
 
-            # Read the 2D positional gradients AFTER backward() has populated them.
-            if DENSIFY_FROM_ITER <= iteration <= DENSIFY_UNTIL_ITER:
-                if info.get("means2d") is not None and info["means2d"].grad is not None:
-                    # info["means2d"] shape: (1, N, 2) — batch dim first, so index [0]
-                    grad_mag = info["means2d"].grad[0].norm(dim=-1)  # (N,)
-                    grad_accum += grad_mag.detach()
-                    grad_count += 1
+            # step_post_backward: runs densification (clone/split/prune/reset)
+            # using the 2D positional gradients populated by backward().
+            # packed=True because gsplat returns packed tensors by default
+            # (radii shape is (nnz, 2) not (C, N, 1)).
+            strategy.step_post_backward(
+                params=splats,
+                optimizers=optimizers,
+                state=strategy_state,
+                step=iteration - 1,  # 0-based
+                info=info,
+                packed=True,
+            )
 
-            # zero_grad AFTER step, matching the gsplat simple_trainer.py reference.
-            # Calling zero_grad before backward is also correct, but the reference
-            # pattern (step → zero_grad) avoids any risk of clearing retained grads
-            # before they are read.
-            optimizer.step()
-            optimizer.zero_grad(set_to_none=True)
-
-            if (
-                DENSIFY_FROM_ITER <= iteration <= DENSIFY_UNTIL_ITER
-                and iteration % DENSIFY_EVERY == 0
-            ):
-                (
-                    means,
-                    log_scales,
-                    quats,
-                    opacities_logit,
-                    sh0,
-                    shN,
-                    grad_accum,
-                    grad_count,
-                    optimizer,
-                ) = self._densify_and_prune(
-                    means=means,
-                    log_scales=log_scales,
-                    quats=quats,
-                    opacities_logit=opacities_logit,
-                    sh0=sh0,
-                    shN=shN,
-                    grad_accum=grad_accum,
-                    grad_count=grad_count,
-                    optimizer=optimizer,
-                    torch_device=torch_device,
-                    torch=torch,
-                )
-
-                # Rebuild the get_sh_coeffs closure after densification since
-                # sh0 and shN are new tensors with a different N.
-                def get_sh_coeffs():
-                    return torch.cat([sh0, shN], dim=1)
-
-            if iteration % OPACITY_RESET_EVERY == 0 and iteration < self.iterations:
-                with torch.no_grad():
-                    opacities_logit.fill_(-4.6)
-                log_info(f"[iter {iteration}] Opacity reset")
+            for opt in optimizers.values():
+                opt.step()
+                opt.zero_grad(set_to_none=True)
 
             if iteration % self.preview_every == 0 or iteration == self.iterations:
                 ckpt_path = self.checkpoints_dir / CHECKPOINT_TEMPLATE.format(iteration)
                 torch.save(
                     {
                         "iteration": iteration,
-                        "means": means.detach().cpu(),
-                        "log_scales": log_scales.detach().cpu(),
-                        "quats": quats.detach().cpu(),
-                        "opacities_logit": opacities_logit.detach().cpu(),
+                        "means": splats["means"].detach().cpu(),
+                        "log_scales": splats["scales"].detach().cpu(),
+                        "quats": splats["quats"].detach().cpu(),
+                        "opacities_logit": splats["opacities"].detach().cpu(),
                         # Save sh0 and shN separately so checkpoints can be reloaded
                         # with the correct per-group learning rates.
-                        "sh0": sh0.detach().cpu(),
-                        "shN": shN.detach().cpu(),
+                        "sh0": splats["sh0"].detach().cpu(),
+                        "shN": splats["shN"].detach().cpu(),
                         "loss": loss.item(),
                     },
                     str(ckpt_path),
@@ -1373,161 +1351,22 @@ class GsplatTrainer(BaseTrainer):
                 log_info(
                     f"[iter {iteration}/{self.iterations}] "
                     f"loss={loss.item():.4f}  "
-                    f"gaussians={means.shape[0]:,}  "
+                    f"gaussians={splats['means'].shape[0]:,}  "
                     f"ckpt={ckpt_path.name}"
                 )
 
         log_step("Saving Outputs")
         self._save_ply(
             path=final_ply_path,
-            means=means,
-            log_scales=log_scales,
-            quats=quats,
-            opacities_logit=opacities_logit,
-            sh_coeffs=get_sh_coeffs(),  # reassemble sh0 + shN → (N, 16, 3)
+            means=splats["means"],
+            log_scales=splats["scales"],
+            quats=splats["quats"],
+            opacities_logit=splats["opacities"],
+            sh_coeffs=torch.cat([splats["sh0"], splats["shN"]], dim=1),
             torch=torch,
         )
         log_success(f"Final model saved: {final_ply_path}")
         return final_ply_path
-
-    def _densify_and_prune(
-        self,
-        means,
-        log_scales,
-        quats,
-        opacities_logit,
-        sh0,
-        shN,
-        grad_accum,
-        grad_count,
-        optimizer,
-        torch_device,
-        torch,
-    ):
-        """Adaptive density control: clone, split, and prune Gaussians.
-
-        Follows the Inria 3DGS paper's adaptive density control algorithm:
-          - Clone: duplicate Gaussians with high positional gradients and small scale
-            (under-reconstructed fine details — e.g. actor's face on LED stage)
-          - Split: replace large Gaussians with two smaller ones at high-gradient regions
-            (over-reconstructed coarse areas — e.g. large background panels)
-          - Prune: remove nearly-transparent Gaussians (opacity < threshold)
-
-        sh0 and shN are kept as separate tensors so their different learning rates
-        are preserved when the optimizer is rebuilt after each densification step.
-
-        Returns updated parameter tensors and a fresh optimizer with the new N.
-        """
-        with torch.no_grad():
-            avg_grad = torch.where(
-                grad_count > 0,
-                grad_accum / grad_count.float(),
-                torch.zeros_like(grad_accum),
-            )
-
-            densify_mask = avg_grad >= DENSIFY_GRAD_THRESHOLD
-            max_scale = torch.exp(log_scales).max(dim=-1).values
-            scene_extent = (
-                (means.max(dim=0).values - means.min(dim=0).values).max().item()
-            )
-            split_threshold = 0.01 * scene_extent
-            split_mask = densify_mask & (max_scale > split_threshold)
-            clone_mask = densify_mask & (max_scale <= split_threshold)
-
-            # Clone: duplicate under-reconstructed small Gaussians
-            if clone_mask.any():
-                means = torch.cat([means, means[clone_mask].detach()], dim=0)
-                log_scales = torch.cat(
-                    [log_scales, log_scales[clone_mask].detach()], dim=0
-                )
-                quats = torch.cat([quats, quats[clone_mask].detach()], dim=0)
-                opacities_logit = torch.cat(
-                    [opacities_logit, opacities_logit[clone_mask].detach()], dim=0
-                )
-                sh0 = torch.cat([sh0, sh0[clone_mask].detach()], dim=0)
-                shN = torch.cat([shN, shN[clone_mask].detach()], dim=0)
-
-            # Split: replace large Gaussians with two smaller ones
-            if split_mask.any():
-                n_split = split_mask.sum().item()
-                stds = torch.exp(log_scales[split_mask])
-                samples = torch.randn(n_split, 3, device=torch_device) * stds
-                new_means_a = means[split_mask] + samples
-                new_means_b = means[split_mask] - samples
-                new_log_scales = log_scales[split_mask] - math.log(1.6)
-                keep = ~split_mask
-                means = torch.cat([means[keep], new_means_a, new_means_b], dim=0)
-                log_scales = torch.cat(
-                    [log_scales[keep], new_log_scales, new_log_scales], dim=0
-                )
-                quats = torch.cat(
-                    [quats[keep], quats[split_mask], quats[split_mask]], dim=0
-                )
-                opacities_logit = torch.cat(
-                    [
-                        opacities_logit[keep],
-                        opacities_logit[split_mask],
-                        opacities_logit[split_mask],
-                    ],
-                    dim=0,
-                )
-                sh0 = torch.cat([sh0[keep], sh0[split_mask], sh0[split_mask]], dim=0)
-                shN = torch.cat([shN[keep], shN[split_mask], shN[split_mask]], dim=0)
-
-            # Prune: remove nearly-transparent Gaussians
-            opacities = torch.sigmoid(opacities_logit)
-            prune_mask = opacities < OPACITY_PRUNE_THRESHOLD
-            if prune_mask.any():
-                keep = ~prune_mask
-                means = means[keep]
-                log_scales = log_scales[keep]
-                quats = quats[keep]
-                opacities_logit = opacities_logit[keep]
-                sh0 = sh0[keep]
-                shN = shN[keep]
-
-            new_n = means.shape[0]
-            grad_accum = torch.zeros(new_n, device=torch_device)
-            grad_count = torch.zeros(new_n, device=torch_device, dtype=torch.int32)
-
-        # Re-attach requires_grad and rebuild optimizer with new tensors.
-        # sh0 and shN get their own param groups with different LRs — this is
-        # critical: shN must train at 20× lower LR than sh0 to avoid overfitting
-        # the view-dependent colour terms.
-        means = means.detach().requires_grad_(True)
-        log_scales = log_scales.detach().requires_grad_(True)
-        quats = quats.detach().requires_grad_(True)
-        opacities_logit = opacities_logit.detach().requires_grad_(True)
-        sh0 = sh0.detach().requires_grad_(True)
-        shN = shN.detach().requires_grad_(True)
-
-        optimizer = torch.optim.Adam(
-            [
-                {"params": [means], "lr": DEFAULT_LR_MEANS, "name": "means"},
-                {"params": [log_scales], "lr": DEFAULT_LR_SCALES, "name": "scales"},
-                {"params": [quats], "lr": DEFAULT_LR_QUATS, "name": "quats"},
-                {
-                    "params": [opacities_logit],
-                    "lr": DEFAULT_LR_OPACITIES,
-                    "name": "opacities",
-                },
-                {"params": [sh0], "lr": DEFAULT_LR_SH0, "name": "sh0"},
-                {"params": [shN], "lr": DEFAULT_LR_SHN, "name": "shN"},
-            ],
-            eps=1e-15,
-        )
-
-        return (
-            means,
-            log_scales,
-            quats,
-            opacities_logit,
-            sh0,
-            shN,
-            grad_accum,
-            grad_count,
-            optimizer,
-        )
 
     def _save_ply(
         self,
@@ -1691,7 +1530,7 @@ def run_training(
     project_path: Path,
     backend: str = "gsplat",
     iterations: int = 15_000,
-    preview_every: int = 500,
+    preview_every: int = 1000,
     resume: bool = False,
     resume_from: Optional[Path] = None,
     restart: bool = False,
@@ -1855,6 +1694,6 @@ def run_training(
     )
     log_success(
         "Done. Open the .ply in a 3DGS viewer:\n"
-        "  SuperSplat: https://supersplat.dev\n"
+        "  SuperSplat: https://superspl.at/editor\n"
         "  Or run: gsforge info"
     )
