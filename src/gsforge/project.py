@@ -503,7 +503,7 @@ class GSProject:
         if not self.is_ingest_done():
             log_error(
                 "No frames have been extracted for this project.\n"
-                "  Run [bold]gsforge ingest --video PATH[/bold] first."
+                "  Run [bold]gsforge ingest --input PATH[/bold] first."
             )
 
     def require_sfm_done(self) -> None:

@@ -144,7 +144,7 @@ The `tests/test_data/ignatius.mp4` file is included for testing. Here is the com
 gsforge init-project --name Ignatius
 
 # Run everything: ingest → SfM → train
-gsforge run-all --video tests/test_data/ignatius.mp4 --project Ignatius.gsproject
+gsforge run-all --input tests/test_data/ignatius.mp4 --project Ignatius.gsproject
 ```
 
 ### Option B — Step by step
@@ -155,7 +155,7 @@ gsforge init-project --name Ignatius
 
 # 2. Extract frames from the video
 #    Default: 5 fps, max 400 frames, full resolution
-gsforge ingest --video tests/test_data/ignatius.mp4 --project Ignatius.gsproject
+gsforge ingest --input tests/test_data/ignatius.mp4 --project Ignatius.gsproject
 
 # 3. Run GLOMAP (global SfM) — fast and robust
 gsforge sfm --project Ignatius.gsproject
@@ -168,6 +168,54 @@ gsforge info --project Ignatius.gsproject
 ```
 
 The final model will be at `Ignatius.gsproject/models/final_scene.ply`.
+
+---
+
+## Image-sequence workflow
+
+gsforge can ingest a numbered image sequence (e.g. frames exported from Nuke,
+Houdini, DaVinci Resolve, or any DCC tool) in addition to video files.
+
+### Supported image formats
+
+`.png`, `.jpg`, `.jpeg`, `.tif`, `.tiff`, `.exr`
+
+### How it works
+
+Provide the **first frame** of the sequence. gsforge detects all sibling frames
+automatically by matching the filename prefix and numeric suffix:
+
+```
+/renders/frame_001.exr   ← provide this
+/renders/frame_002.exr   ← detected automatically
+/renders/frame_003.exr
+...
+```
+
+The filename must end with digits (e.g. `frame_001`, `shot0042`, `render_0001`).
+At least 2 matching frames must exist in the same directory.
+
+### Example
+
+```bash
+gsforge init-project --name MyScene
+gsforge ingest --input /renders/frame_001.exr --project MyScene.gsproject
+
+# With a custom sequence FPS (default is 24)
+gsforge ingest --input /renders/frame_001.png --sequence-fps 30 --project MyScene.gsproject
+
+# Cap to 200 frames and downscale to half resolution
+gsforge ingest --input /renders/frame_001.tif --max-frames 200 --downscale 2 --project MyScene.gsproject
+```
+
+### Notes
+
+- `--target-fps` is ignored for image sequences (it only applies to video files).
+- `--sequence-fps` sets the assumed frame rate for reporting and `project.json`
+  metadata. It does **not** affect which frames are selected.
+- `--max-frames` applies to both video and image-sequence inputs.
+- Source frames are copied into `source/` for self-containment, then
+  re-exported as `frame_000001.png … frame_NNNNNN.png` into `preprocess/`.
 
 ---
 
@@ -267,7 +315,7 @@ CUDA ran out of memory during training.
 You can also reduce the input resolution during ingest:
 
 ```bash
-gsforge ingest --video footage.mp4 --downscale 2  # half resolution = ~4x less VRAM
+gsforge ingest --input footage.mp4 --downscale 2  # half resolution = ~4x less VRAM
 ```
 
 ---
@@ -288,13 +336,13 @@ Even at 5 fps, a 90-second clip produces 450 frames. GLOMAP's global bundle adju
 
 ```bash
 # Slow camera, short clip — can use more frames
-gsforge ingest --video footage.mp4 --target-fps 8 --max-frames 600
+gsforge ingest --input footage.mp4 --target-fps 8 --max-frames 600
 
 # Fast camera, long clip — use fewer, more spread-out frames
-gsforge ingest --video footage.mp4 --target-fps 3 --max-frames 250
+gsforge ingest --input footage.mp4 --target-fps 3 --max-frames 250
 
 # Downscale to half resolution for faster SfM and less VRAM during training
-gsforge ingest --video footage.mp4 --downscale 2
+gsforge ingest --input footage.mp4 --downscale 2
 ```
 
 ---
@@ -307,7 +355,7 @@ gsforge is designed to be modular. You can use it purely as a fast GLOMAP runner
 
 ```bash
 gsforge init-project --name MyScene
-gsforge ingest --video footage.mp4 --project MyScene.gsproject
+gsforge ingest --input footage.mp4 --project MyScene.gsproject
 gsforge sfm --project MyScene.gsproject --method glomap
 ```
 
@@ -354,7 +402,7 @@ gsforge train --project MyScene.gsproject
 ```
 MyScene.gsproject/
 ├── project.json          ← pipeline metadata (version, status, counts, paths)
-├── source/               ← original video file (copied on ingest)
+├── source/               ← original source file(s) (video or image sequence, copied on ingest)
 ├── preprocess/           ← extracted frames: frame_000001.png …
 ├── sfm/
 │   ├── database.db       ← COLMAP feature database
@@ -388,13 +436,13 @@ The `project.json` file tracks the full pipeline state:
 
 ```
 gsforge init-project   --name NAME [--project DIR]
-gsforge ingest         --video PATH [--project DIR] [--target-fps N] [--max-frames N] [--downscale N]
+gsforge ingest         --input PATH [--project DIR] [--target-fps N] [--max-frames N] [--downscale N] [--sequence-fps N]
 gsforge sfm            [--project DIR] [--method glomap|colmap]
 gsforge import-colmap  --source PATH [--project DIR]
 gsforge export-colmap  [--project DIR] [--output DIR]
 gsforge train          [--project DIR] [--backend gsplat] [--iterations N] [--preview-every N]
 gsforge info           [--project DIR]
-gsforge run-all        --video PATH [--project DIR] [--target-fps N] [--max-frames N] [--downscale N] [--method STR] [--iterations N]
+gsforge run-all        --input PATH [--project DIR] [--target-fps N] [--max-frames N] [--downscale N] [--sequence-fps N] [--method STR] [--iterations N]
 ```
 
 For any command: `gsforge COMMAND --help`

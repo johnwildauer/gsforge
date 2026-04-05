@@ -36,12 +36,13 @@ import typer
 from rich.console import Console
 
 from gsforge.utils import (
+    DEFAULT_DOWNSCALE,
     DEFAULT_MAX_FRAMES,
+    DEFAULT_PREVIEW_EVERY,
+    DEFAULT_SEQUENCE_FPS,
     DEFAULT_SFM_METHOD,
     DEFAULT_TARGET_FPS,
     DEFAULT_TRAIN_ITERATIONS,
-    DEFAULT_PREVIEW_EVERY,
-    DEFAULT_DOWNSCALE,
     console,
     log_error,
     log_info,
@@ -63,11 +64,11 @@ app = typer.Typer(
         "[bold cyan]gsforge[/bold cyan] — CLI-first 3D Gaussian Splatting for virtual production.\n\n"
         "Typical workflow:\n"
         "  1. [bold]gsforge init-project --name MyScene[/bold]\n"
-        "  2. [bold]gsforge ingest --video footage.mp4[/bold]\n"
+        "  2. [bold]gsforge ingest --input footage.mp4[/bold]\n"
         "  3. [bold]gsforge sfm[/bold]\n"
         "  4. [bold]gsforge train[/bold]\n\n"
         "Or run everything at once:\n"
-        "  [bold]gsforge run-all --video footage.mp4[/bold]"
+        "  [bold]gsforge run-all --input footage.mp4[/bold]"
     ),
     rich_markup_mode="rich",
     no_args_is_help=True,
@@ -123,7 +124,7 @@ def init_project(
             ("Subfolders", "source/, preprocess/, sfm/, models/, renders/, logs/"),
         ],
     )
-    log_success("Done. Next step: [bold]gsforge ingest --video PATH[/bold]")
+    log_success("Done. Next step: [bold]gsforge ingest --input PATH[/bold]")
 
 
 # ---------------------------------------------------------------------------
@@ -133,11 +134,16 @@ def init_project(
 
 @app.command("ingest")
 def ingest(
-    video: Path = typer.Option(
+    input: Path = typer.Option(
         ...,
-        "--video",
-        "-v",
-        help="Path to the source video file.",
+        "--input",
+        "-i",
+        help=(
+            "Path to a video file (.mp4, .mov) or the first frame of a numbered "
+            "image sequence (.png, .jpg, .jpeg, .tif, .tiff, .exr). "
+            "For image sequences, sibling frames are detected automatically from "
+            "the filename pattern."
+        ),
         exists=True,
         file_okay=True,
         dir_okay=False,
@@ -157,9 +163,10 @@ def ingest(
         DEFAULT_TARGET_FPS,
         "--target-fps",
         help=(
-            f"Extract this many frames per second of video. "
+            f"Extract this many frames per second of video (video inputs only). "
             f"Default {DEFAULT_TARGET_FPS} fps is tuned for VP footage: "
-            "enough overlap for GLOMAP without drowning it in near-duplicate frames."
+            "enough overlap for GLOMAP without drowning it in near-duplicate frames. "
+            "Ignored for image-sequence inputs."
         ),
     ),
     max_frames: int = typer.Option(
@@ -168,7 +175,8 @@ def ingest(
         help=(
             f"Hard cap on total extracted frames. "
             f"Default {DEFAULT_MAX_FRAMES} keeps SfM tractable on a workstation. "
-            "Raise for very large or complex scenes."
+            "Raise for very large or complex scenes. Applies to both video and "
+            "image-sequence inputs."
         ),
     ),
     downscale: int = typer.Option(
@@ -176,20 +184,38 @@ def ingest(
         "--downscale",
         help=(
             "Spatial downscale factor (1 = full res, 2 = half res). "
-            "Downscaling by 2 cuts COLMAP feature extraction time ~4x."
+            "Downscaling by 2 cuts COLMAP feature extraction time ~4x. "
+            "Applies to both video and image-sequence inputs."
+        ),
+    ),
+    sequence_fps: int = typer.Option(
+        DEFAULT_SEQUENCE_FPS,
+        "--sequence-fps",
+        help=(
+            f"Assumed frame rate of an image sequence (default {DEFAULT_SEQUENCE_FPS} fps). "
+            "Used for reporting and stored in project.json. "
+            "Has no effect on video inputs."
         ),
     ),
 ) -> None:
-    """Extract frames from a video file into the project's preprocess/ folder.
+    """Extract frames from a video file or image sequence into preprocess/.
 
+    [bold]Video inputs (.mp4, .mov)[/bold]
     Uses FFmpeg with smart downsampling: if the video would produce more than
     [bold]--max-frames[/bold] at the requested FPS, frames are evenly spaced
     across the clip so you always get the best temporal coverage.
 
+    [bold]Image-sequence inputs (.png, .jpg, .jpeg, .tif, .tiff, .exr)[/bold]
+    Provide the first frame of a numbered sequence (e.g. frame_001.png).
+    gsforge detects all sibling frames automatically, applies the --max-frames
+    cap, and re-exports them as frame_NNNNNN.png into preprocess/.
+
     Example:
-        gsforge ingest --video footage.mp4
-        gsforge ingest --video footage.mp4 --target-fps 3 --max-frames 300
-        gsforge ingest --video footage.mp4 --downscale 2
+        gsforge ingest --input footage.mp4
+        gsforge ingest --input footage.mov --target-fps 3 --max-frames 300
+        gsforge ingest --input footage.mp4 --downscale 2
+        gsforge ingest --input frame_001.png
+        gsforge ingest --input frame_001.exr --sequence-fps 30 --max-frames 200
     """
     from gsforge.project import GSProject
     from gsforge import ingest as ingest_module
@@ -198,21 +224,23 @@ def ingest(
 
     log_step(
         "ingest",
-        f"video={video.name}  fps={target_fps}  max={max_frames}  scale=1/{downscale}",
+        f"input={input.name}  fps={target_fps}  seq-fps={sequence_fps}  "
+        f"max={max_frames}  scale=1/{downscale}",
     )
 
     result = ingest_module.extract_frames(
         project=proj,
-        video_path=video,
+        input_path=input,
         target_fps=target_fps,
         max_frames=max_frames,
         downscale=downscale,
+        sequence_fps=sequence_fps,
     )
 
     print_summary_table(
         title="[bold cyan]Ingest complete[/bold cyan]",
         rows=[
-            ("Video", str(video)),
+            ("Input", str(input)),
             ("Frames extracted", str(result.num_frames)),
             ("Effective FPS", f"{result.effective_fps:.2f}"),
             ("Resolution", result.resolution),
@@ -593,11 +621,14 @@ def info(
 
 @app.command("run-all")
 def run_all(
-    video: Path = typer.Option(
+    input: Path = typer.Option(
         ...,
-        "--video",
-        "-v",
-        help="Path to the source video file.",
+        "--input",
+        "-i",
+        help=(
+            "Path to a video file (.mp4, .mov) or the first frame of a numbered "
+            "image sequence (.png, .jpg, .jpeg, .tif, .tiff, .exr)."
+        ),
         exists=True,
         file_okay=True,
         dir_okay=False,
@@ -616,17 +647,19 @@ def run_all(
     target_fps: int = typer.Option(DEFAULT_TARGET_FPS, "--target-fps"),
     max_frames: int = typer.Option(DEFAULT_MAX_FRAMES, "--max-frames"),
     downscale: int = typer.Option(DEFAULT_DOWNSCALE, "--downscale"),
+    sequence_fps: int = typer.Option(DEFAULT_SEQUENCE_FPS, "--sequence-fps"),
     method: str = typer.Option(DEFAULT_SFM_METHOD, "--method"),
     iterations: int = typer.Option(DEFAULT_TRAIN_ITERATIONS, "--iterations"),
 ) -> None:
     """Run the full pipeline: ingest → SfM → train.
 
-    Convenience command for when you want to go from raw video to a trained
-    3DGS model in one shot with sensible defaults.
+    Convenience command for when you want to go from raw footage or an image
+    sequence to a trained 3DGS model in one shot with sensible defaults.
 
     Example:
-        gsforge run-all --video footage.mp4
-        gsforge run-all --video footage.mp4 --method colmap --iterations 30000
+        gsforge run-all --input footage.mp4
+        gsforge run-all --input footage.mov --method colmap --iterations 30000
+        gsforge run-all --input frame_001.png --sequence-fps 24
     """
     from gsforge.project import GSProject
     from gsforge import ingest as ingest_module
@@ -635,8 +668,9 @@ def run_all(
     print_panel(
         title="gsforge run-all",
         body=(
-            f"Video:      {video}\n"
+            f"Input:      {input}\n"
             f"Target FPS: {target_fps}\n"
+            f"Seq FPS:    {sequence_fps}\n"
             f"Max frames: {max_frames}\n"
             f"Downscale:  1/{downscale}\n"
             f"SfM method: {method}\n"
@@ -650,10 +684,11 @@ def run_all(
     log_step("Step 1/3 — ingest")
     result = ingest_module.extract_frames(
         project=proj,
-        video_path=video,
+        input_path=input,
         target_fps=target_fps,
         max_frames=max_frames,
         downscale=downscale,
+        sequence_fps=sequence_fps,
     )
     log_success(f"Ingest done — {result.num_frames} frames extracted.")
 

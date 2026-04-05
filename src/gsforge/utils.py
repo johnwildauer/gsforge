@@ -59,6 +59,11 @@ DEFAULT_SFM_METHOD: str = "glomap"
 #: between quality and training time (~10–20 min on a modern GPU).
 DEFAULT_TRAIN_ITERATIONS: int = 15_000
 
+#: Assumed frame rate for image sequences when the user does not specify one.
+#: 24 fps is the standard cinematic frame rate and a safe default for VP
+#: image sequences exported from DCC tools (Nuke, Houdini, Resolve, etc.).
+DEFAULT_SEQUENCE_FPS: int = 24
+
 #: Save a preview render every N training iterations.
 DEFAULT_PREVIEW_EVERY: int = 500
 
