@@ -60,11 +60,24 @@ DEFAULT_LR_SHN: float = 2.5e-3 / 20  # Higher-order SH — 20× lower than DC, p
 
 # Densification schedule
 DENSIFY_FROM_ITER: int = 500
-DENSIFY_EVERY: int = 100
+DENSIFY_EVERY: int = 100  # refine_every — matches gsplat DefaultStrategy default
 DENSIFY_UNTIL_ITER: int = 15_000
-DENSIFY_GRAD_THRESHOLD: float = 2e-4
+# grow_grad2d threshold: absgrad mode requires a higher value (0.0008) because the
+# absolute gradient accumulator is ~4× larger than the signed average used in the
+# original 3DGS paper.  Non-absgrad mode uses the classic 0.0002 threshold.
+# gsforge always runs absgrad=True (see DefaultStrategy construction below).
+DENSIFY_GRAD_THRESHOLD_ABSGRAD: float = 8e-4  # absgrad=True  (default)
+DENSIFY_GRAD_THRESHOLD_NORMAL: float = 2e-4  # absgrad=False (legacy)
+DENSIFY_GRAD_THRESHOLD: float = DENSIFY_GRAD_THRESHOLD_ABSGRAD  # active default
 OPACITY_PRUNE_THRESHOLD: float = 0.005
-OPACITY_RESET_EVERY: int = 3_000
+OPACITY_RESET_EVERY: int = 3_000  # reset_every — matches gsplat DefaultStrategy default
+
+# Scene-scale adaptive thresholds (normalised by scene_scale, matching gsplat DefaultStrategy).
+# A Gaussian whose max world-space scale exceeds scene_scale * PRUNE_SCALE3D is pruned.
+# A Gaussian whose max world-space scale is <= scene_scale * GROW_SCALE3D is duplicated;
+# above that threshold it is split instead.
+PRUNE_SCALE3D: float = 0.1  # prune_scale3d — matches gsplat DefaultStrategy default
+GROW_SCALE3D: float = 0.01  # grow_scale3d  — matches gsplat DefaultStrategy default
 
 
 # ---------------------------------------------------------------------------
@@ -258,6 +271,70 @@ class BaseTrainer(ABC):
         ensure_dir(self.models_dir)
         ensure_dir(self.renders_dir)
         ensure_dir(self.checkpoints_dir)
+
+
+# ---------------------------------------------------------------------------
+# Scene-scale estimation
+# ---------------------------------------------------------------------------
+
+
+def _compute_scene_scale(points3d: list, fallback: float = 1.0) -> float:
+    """Estimate a robust spatial extent for the scene from the COLMAP point cloud.
+
+    Uses the 90th-percentile of per-point distances from the cloud centroid.
+    This is stable against outlier points (e.g. sky triangulations) and gives
+    a scene-normalised reference length that matches the convention used by
+    gsplat's DefaultStrategy for ``grow_scale3d`` and ``prune_scale3d``.
+
+    Parameters
+    ----------
+    points3d : list[ColmapPoint3D]
+        Raw COLMAP 3D points loaded before any training refinement.
+    fallback : float
+        Value returned when the cloud is empty or degenerate (avoids
+        divide-by-zero in downstream threshold computations).
+
+    Returns
+    -------
+    float
+        90th-percentile distance from the cloud centroid, or ``fallback``
+        if the cloud has fewer than 2 points or all distances are zero.
+    """
+    if len(points3d) < 2:
+        log_warning(
+            f"Point cloud has {len(points3d)} point(s) — "
+            f"using fallback scene_scale={fallback:.4f}."
+        )
+        return fallback
+
+    try:
+        import torch
+
+        pts = torch.tensor(
+            [[p.x, p.y, p.z] for p in points3d],
+            dtype=torch.float32,
+        )
+        centroid = pts.mean(dim=0)
+        dists = (pts - centroid).norm(dim=1)  # (N,) Euclidean distances from centroid
+
+        # 90th-percentile extent — robust to outlier triangulations.
+        scene_scale = float(torch.quantile(dists, 0.90).item())
+
+        if scene_scale <= 0.0:
+            log_warning(
+                "All COLMAP points are coincident — "
+                f"using fallback scene_scale={fallback:.4f}."
+            )
+            return fallback
+
+        return scene_scale
+
+    except Exception as exc:  # pragma: no cover — defensive only
+        log_warning(
+            f"scene_scale estimation failed ({exc}) — "
+            f"using fallback scene_scale={fallback:.4f}."
+        )
+        return fallback
 
 
 # ---------------------------------------------------------------------------
@@ -1189,19 +1266,38 @@ class GsplatTrainer(BaseTrainer):
             ]
         }
 
+        # Compute scene scale from the initial COLMAP point cloud so that
+        # grow_scale3d and prune_scale3d thresholds are normalised to the
+        # actual spatial extent of the scene rather than an arbitrary unit.
+        # On resume paths colmap_data.points3d is still available (loaded
+        # earlier in train()), so scene_scale is always derived from the
+        # original sparse cloud regardless of whether we are resuming.
+        scene_scale = _compute_scene_scale(colmap_data.points3d)
+        log_info(f"Scene scale (90th-pct point-cloud extent): {scene_scale:.4f}")
+
         # Configure DefaultStrategy to match our densification schedule.
+        # absgrad=True: accumulate absolute 2D positional gradients — this
+        # requires grow_grad2d=DENSIFY_GRAD_THRESHOLD_ABSGRAD (0.0008) rather
+        # than the classic 0.0002 used in the original 3DGS paper.
+        # grow_scale3d / prune_scale3d are scene-scale-normalised thresholds
+        # (multiplied by scene_scale inside DefaultStrategy._grow_gs /
+        # _prune_gs) so Gaussian growth and pruning adapt to scene extent.
         strategy = DefaultStrategy(
             refine_start_iter=DENSIFY_FROM_ITER,
             refine_stop_iter=DENSIFY_UNTIL_ITER,
-            refine_every=DENSIFY_EVERY,
-            reset_every=OPACITY_RESET_EVERY,
+            refine_every=DENSIFY_EVERY,  # 100 — matches gsplat default
+            reset_every=OPACITY_RESET_EVERY,  # 3000 — matches gsplat default
             prune_opa=OPACITY_PRUNE_THRESHOLD,
-            grow_grad2d=DENSIFY_GRAD_THRESHOLD,
-            absgrad=True,  # use absolute gradients — critical for correct densification
+            grow_grad2d=DENSIFY_GRAD_THRESHOLD,  # 0.0008 for absgrad mode
+            grow_scale3d=GROW_SCALE3D,  # 0.01 * scene_scale → split vs duplicate
+            prune_scale3d=PRUNE_SCALE3D,  # 0.1  * scene_scale → prune oversized GSs
+            absgrad=True,  # use absolute gradients — requires grow_grad2d=0.0008
             verbose=False,
         )
         strategy.check_sanity(splats, optimizers)
-        strategy_state = strategy.initialize_state(scene_scale=1.0)
+        # Pass scene_scale so DefaultStrategy normalises grow/prune thresholds
+        # to the actual spatial extent of this scene.
+        strategy_state = strategy.initialize_state(scene_scale=scene_scale)
 
         log_info("Loading training images...")
         train_images: list = []
