@@ -37,11 +37,10 @@ from rich.console import Console
 
 from gsforge.utils import (
     DEFAULT_DOWNSCALE,
-    DEFAULT_MAX_FRAMES,
+    DEFAULT_NUM_IMAGES,
     DEFAULT_PREVIEW_EVERY,
     DEFAULT_SEQUENCE_FPS,
     DEFAULT_SFM_METHOD,
-    DEFAULT_TARGET_FPS,
     DEFAULT_TRAIN_ITERATIONS,
     console,
     log_error,
@@ -159,24 +158,19 @@ def ingest(
         dir_okay=True,
         resolve_path=True,
     ),
-    target_fps: int = typer.Option(
-        DEFAULT_TARGET_FPS,
-        "--target-fps",
+    num_images: int = typer.Option(
+        DEFAULT_NUM_IMAGES,
+        "--num-images",
+        "-n",
         help=(
-            f"Extract this many frames per second of video (video inputs only). "
-            f"Default {DEFAULT_TARGET_FPS} fps is tuned for VP footage: "
-            "enough overlap for GLOMAP without drowning it in near-duplicate frames. "
-            "Ignored for image-sequence inputs."
-        ),
-    ),
-    max_frames: int = typer.Option(
-        DEFAULT_MAX_FRAMES,
-        "--max-frames",
-        help=(
-            f"Hard cap on total extracted frames. "
-            f"Default {DEFAULT_MAX_FRAMES} keeps SfM tractable on a workstation. "
-            "Raise for very large or complex scenes. Applies to both video and "
-            "image-sequence inputs."
+            f"Number of images to extract from the source. "
+            f"Default {DEFAULT_NUM_IMAGES} is tuned for VP footage: enough for "
+            "GLOMAP to produce a high-quality reconstruction on a workstation. "
+            "Frames are sampled evenly across the full sequence so temporal "
+            "coverage is maximised regardless of source length. "
+            "If the source has fewer frames than requested, all frames are used "
+            "and you will be informed. "
+            "Applies to both video and image-sequence inputs."
         ),
     ),
     downscale: int = typer.Option(
@@ -193,29 +187,36 @@ def ingest(
         "--sequence-fps",
         help=(
             f"Assumed frame rate of an image sequence (default {DEFAULT_SEQUENCE_FPS} fps). "
-            "Used for reporting and stored in project.json. "
+            "Used for reporting (effective FPS) and stored in project.json. "
+            "Does not affect which frames are selected. "
             "Has no effect on video inputs."
         ),
     ),
 ) -> None:
     """Extract frames from a video file or image sequence into preprocess/.
 
+    [bold]Frame selection[/bold]
+    Use [bold]--num-images[/bold] to specify exactly how many frames to extract.
+    Frames are sampled evenly across the full source sequence so you always get
+    the best temporal coverage.  If the source has fewer frames than requested,
+    all frames are used and you are informed.
+
     [bold]Video inputs (.mp4, .mov)[/bold]
-    Uses FFmpeg with smart downsampling: if the video would produce more than
-    [bold]--max-frames[/bold] at the requested FPS, frames are evenly spaced
-    across the clip so you always get the best temporal coverage.
+    Uses FFmpeg with a select filter to extract exactly the requested frames
+    at evenly-spaced intervals across the clip.
 
     [bold]Image-sequence inputs (.png, .jpg, .jpeg, .tif, .tiff, .exr)[/bold]
     Provide the first frame of a numbered sequence (e.g. frame_001.png).
-    gsforge detects all sibling frames automatically, applies the --max-frames
-    cap, and re-exports them as frame_NNNNNN.png into preprocess/.
+    gsforge detects all sibling frames automatically, applies even-stride
+    subsampling to reach --num-images, and re-exports them as frame_NNNNNN.png
+    into preprocess/.
 
     Example:
         gsforge ingest --input footage.mp4
-        gsforge ingest --input footage.mov --target-fps 3 --max-frames 300
+        gsforge ingest --input footage.mp4 --num-images 500
         gsforge ingest --input footage.mp4 --downscale 2
         gsforge ingest --input frame_001.png
-        gsforge ingest --input frame_001.exr --sequence-fps 30 --max-frames 200
+        gsforge ingest --input frame_001.exr --num-images 200 --sequence-fps 30
     """
     from gsforge.project import GSProject
     from gsforge import ingest as ingest_module
@@ -224,15 +225,14 @@ def ingest(
 
     log_step(
         "ingest",
-        f"input={input.name}  fps={target_fps}  seq-fps={sequence_fps}  "
-        f"max={max_frames}  scale=1/{downscale}",
+        f"input={input.name}  num-images={num_images}  "
+        f"seq-fps={sequence_fps}  scale=1/{downscale}",
     )
 
     result = ingest_module.extract_frames(
         project=proj,
         input_path=input,
-        target_fps=target_fps,
-        max_frames=max_frames,
+        num_images=num_images,
         downscale=downscale,
         sequence_fps=sequence_fps,
     )
@@ -241,6 +241,7 @@ def ingest(
         title="[bold cyan]Ingest complete[/bold cyan]",
         rows=[
             ("Input", str(input)),
+            ("Images requested", str(num_images)),
             ("Frames extracted", str(result.num_frames)),
             ("Effective FPS", f"{result.effective_fps:.2f}"),
             ("Resolution", result.resolution),
@@ -372,7 +373,7 @@ def sfm(
             ("Method", method),
             ("Status", result.status),
             ("Cameras registered", str(result.camera_count)),
-            ("Sparse model", str(proj.sparse_dir)),
+            ("Sparse model", str(result.sparse_dir)),
         ],
     )
     log_success("Done. Next step: [bold]gsforge train[/bold]")
@@ -644,8 +645,15 @@ def run_all(
         dir_okay=True,
         resolve_path=True,
     ),
-    target_fps: int = typer.Option(DEFAULT_TARGET_FPS, "--target-fps"),
-    max_frames: int = typer.Option(DEFAULT_MAX_FRAMES, "--max-frames"),
+    num_images: int = typer.Option(
+        DEFAULT_NUM_IMAGES,
+        "--num-images",
+        "-n",
+        help=(
+            f"Number of images to extract from the source (default {DEFAULT_NUM_IMAGES}). "
+            "Frames are sampled evenly across the full sequence."
+        ),
+    ),
     downscale: int = typer.Option(DEFAULT_DOWNSCALE, "--downscale"),
     sequence_fps: int = typer.Option(DEFAULT_SEQUENCE_FPS, "--sequence-fps"),
     method: str = typer.Option(DEFAULT_SFM_METHOD, "--method"),
@@ -658,6 +666,7 @@ def run_all(
 
     Example:
         gsforge run-all --input footage.mp4
+        gsforge run-all --input footage.mp4 --num-images 500
         gsforge run-all --input footage.mov --method colmap --iterations 30000
         gsforge run-all --input frame_001.png --sequence-fps 24
     """
@@ -668,13 +677,12 @@ def run_all(
     print_panel(
         title="gsforge run-all",
         body=(
-            f"Input:      {input}\n"
-            f"Target FPS: {target_fps}\n"
-            f"Seq FPS:    {sequence_fps}\n"
-            f"Max frames: {max_frames}\n"
-            f"Downscale:  1/{downscale}\n"
-            f"SfM method: {method}\n"
-            f"Iterations: {iterations}"
+            f"Input:       {input}\n"
+            f"Num images:  {num_images}\n"
+            f"Seq FPS:     {sequence_fps}\n"
+            f"Downscale:   1/{downscale}\n"
+            f"SfM method:  {method}\n"
+            f"Iterations:  {iterations}"
         ),
     )
 
@@ -685,8 +693,7 @@ def run_all(
     result = ingest_module.extract_frames(
         project=proj,
         input_path=input,
-        target_fps=target_fps,
-        max_frames=max_frames,
+        num_images=num_images,
         downscale=downscale,
         sequence_fps=sequence_fps,
     )
@@ -711,6 +718,7 @@ def run_all(
     print_summary_table(
         title="[bold cyan]run-all complete[/bold cyan]",
         rows=[
+            ("Images requested", str(num_images)),
             ("Frames extracted", str(result.num_frames)),
             ("Cameras registered", str(sfm_result.camera_count)),
             ("SfM model", str(proj.sparse_dir)),

@@ -205,7 +205,11 @@ class BaseTrainer(ABC):
         self.iterations = iterations
         self.preview_every = preview_every
 
-        self.sparse_dir: Path = project.sparse_dir
+        # Use best_sparse_dir: the sub-model with the most registered images,
+        # as selected by select_best_sparse_model() after the SfM run.
+        # Falls back to sparse/0/ for projects created before this field was
+        # introduced (backward compatibility).
+        self.sparse_dir: Path = project.best_sparse_dir
         self.image_dir: Path = project.preprocess_dir
         self.models_dir: Path = project.models_dir
         self.renders_dir: Path = project.renders_dir
@@ -225,17 +229,23 @@ class BaseTrainer(ABC):
     def _validate_inputs(self) -> None:
         """Validate SfM output and images exist before training starts.
 
+        Uses ``self.sparse_dir`` which is set to ``project.best_sparse_dir``
+        — the sub-model with the most registered images selected after SfM.
+
         Raises
         ------
         FileNotFoundError
-            If sparse/0/ is missing or contains no COLMAP model files.
+            If the selected sparse model directory is missing or contains no
+            COLMAP model files.
         ValueError
             If preprocess/ has no images.
         """
         if not self.sparse_dir.exists():
             raise FileNotFoundError(
                 f"No SfM reconstruction found at: {self.sparse_dir}\n"
-                "  Run 'gsforge sfm' or 'gsforge import-colmap' before training."
+                "  Run 'gsforge sfm' or 'gsforge import-colmap' before training.\n"
+                "  If you have multiple sparse sub-models, check that the best one\n"
+                "  was recorded in project.json (sparse_model_dir field)."
             )
 
         bin_files = {"cameras.bin", "images.bin", "points3D.bin"}
@@ -263,7 +273,8 @@ class BaseTrainer(ABC):
             )
 
         log_info(
-            f"Validated inputs: {len(images)} images, sparse model at {self.sparse_dir}"
+            f"Validated inputs: {len(images)} images, "
+            f"sparse model at {self.sparse_dir}"
         )
 
     def _ensure_output_dirs(self) -> None:
@@ -1665,6 +1676,61 @@ def run_training(
     from gsforge.project import GSProject
 
     proj = GSProject.from_path(project_path)
+
+    # ------------------------------------------------------------------
+    # Auto-select the best sparse sub-model if not already recorded.
+    #
+    # This handles two cases:
+    #   1. Projects created before sparse_model_dir was introduced (old
+    #      project.json files that have no sparse_model_dir field).
+    #   2. Projects where the user ran `gsforge sfm` with an older version
+    #      of gsforge that didn't call select_best_sparse_model().
+    #
+    # We run the selection now, update project.json, and the trainer will
+    # pick up the correct path via project.best_sparse_dir.
+    # ------------------------------------------------------------------
+    if proj.meta.sparse_model_dir is None and proj.is_sfm_done():
+        sparse_parent = proj.sfm_dir / "sparse"
+        from gsforge.sfm import (
+            enumerate_sparse_models,
+            find_colmap_binary,
+            select_best_sparse_model,
+        )
+
+        models = enumerate_sparse_models(sparse_parent)
+        if len(models) > 1:
+            log_info(
+                f"sparse_model_dir not set in project.json — running model selection "
+                f"across {len(models)} sparse sub-models to find the best one."
+            )
+            try:
+                colmap_bin = find_colmap_binary()
+                best = select_best_sparse_model(colmap_bin, sparse_parent)
+                proj.update_after_sfm(
+                    sfm_method=proj.meta.sfm_method or "colmap",  # type: ignore[arg-type]
+                    sfm_status="completed",
+                    camera_count=proj.meta.camera_count or 0,
+                    sparse_model_dir=str(best.relative_to(proj.root)),
+                )
+                log_info(
+                    f"Updated project.json: sparse_model_dir = {proj.meta.sparse_model_dir}"
+                )
+            except Exception as exc:
+                log_warning(
+                    f"Could not auto-select best sparse model: {exc}\n"
+                    "  Falling back to sparse/0/."
+                )
+        elif len(models) == 1:
+            # Only one model — record it so we don't re-check next time
+            proj.update_after_sfm(
+                sfm_method=proj.meta.sfm_method or "colmap",  # type: ignore[arg-type]
+                sfm_status="completed",
+                camera_count=proj.meta.camera_count or 0,
+                sparse_model_dir=str(models[0].relative_to(proj.root)),
+            )
+            log_info(
+                f"Recorded single sparse model in project.json: {proj.meta.sparse_model_dir}"
+            )
 
     # ------------------------------------------------------------------
     # Resolve which checkpoint to use (if any)

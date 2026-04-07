@@ -37,11 +37,21 @@ COLMAP pipeline (both methods)
 
 Output
 ------
-All SfM output goes into ``project/sfm/``.  The sparse model is written to
-``project/sfm/sparse/0/`` in standard COLMAP binary format:
+All SfM output goes into ``project/sfm/``.  The mapper may produce multiple
+sparse sub-models: ``project/sfm/sparse/0/``, ``project/sfm/sparse/1/``, etc.
+Each sub-model is a standard COLMAP binary reconstruction:
   - cameras.bin
   - images.bin
   - points3D.bin
+
+Sparse-model selection
+----------------------
+After the mapper completes, ``select_best_sparse_model()`` enumerates all
+sub-model directories under ``sfm/sparse/``, runs ``colmap model_analyzer``
+on each, parses the registered-image count from the output, and returns the
+sub-model with the most registered images.  This is the model used for
+training.  If only one sub-model exists it is used directly.  If analysis
+fails for a candidate the error is logged and evaluation continues.
 
 This is the format expected by gsplat, nerfstudio, LichtFeld Studio, and
 the COLMAP GUI.
@@ -49,6 +59,7 @@ the COLMAP GUI.
 
 from __future__ import annotations
 
+import re
 import shutil
 import subprocess
 from dataclasses import dataclass
@@ -82,7 +93,7 @@ class SfmResult:
 
     status: str  # "completed" or "failed"
     camera_count: int  # number of cameras successfully registered
-    sparse_dir: Path  # absolute path to sparse/0/
+    sparse_dir: Path  # absolute path to the best sparse sub-model directory
 
 
 # ---------------------------------------------------------------------------
@@ -419,6 +430,206 @@ def count_registered_cameras(sparse_dir: Path) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Sparse-model discovery and best-model selection
+# ---------------------------------------------------------------------------
+
+
+def enumerate_sparse_models(sparse_parent: Path) -> list[Path]:
+    """Return all COLMAP sub-model directories under *sparse_parent*.
+
+    COLMAP's mapper writes sub-models as numbered subdirectories:
+    ``sparse/0/``, ``sparse/1/``, etc.  Each must contain at least one of
+    the canonical COLMAP model files (cameras.bin, images.bin, points3D.bin
+    or their .txt equivalents) to be considered a valid model.
+
+    Parameters
+    ----------
+    sparse_parent:
+        The ``sfm/sparse/`` directory (parent of the numbered sub-models).
+
+    Returns
+    -------
+    list[Path]
+        Sorted list of valid sub-model directories (ascending numeric order).
+        Empty list if none are found.
+    """
+    if not sparse_parent.is_dir():
+        return []
+
+    bin_files = {"cameras.bin", "images.bin", "points3D.bin"}
+    txt_files = {"cameras.txt", "images.txt", "points3D.txt"}
+
+    candidates: list[Path] = []
+    for entry in sparse_parent.iterdir():
+        if not entry.is_dir():
+            continue
+        # Must be a numeric name (0, 1, 2, …)
+        if not entry.name.isdigit():
+            continue
+        existing = {f.name for f in entry.iterdir() if f.is_file()}
+        if (bin_files & existing) or (txt_files & existing):
+            candidates.append(entry)
+
+    # Sort numerically by directory name
+    candidates.sort(key=lambda p: int(p.name))
+    return candidates
+
+
+def analyze_sparse_model(colmap_bin: Path, model_dir: Path) -> Optional[int]:
+    """Run ``colmap model_analyzer`` on *model_dir* and return registered image count.
+
+    Uses the ``--path`` flag (not ``--input_path``) which is the correct flag
+    for ``colmap model_analyzer`` in COLMAP 4.x.
+
+    Parses the analyzer's stdout/stderr for the ``Registered images:`` line,
+    e.g.:
+        Registered images: 398
+
+    ``Registered images`` is preferred over the bare ``Images:`` line because
+    COLMAP also prints ``Images: N`` for the total image count in the database,
+    which may differ from the number actually registered in the reconstruction.
+
+    Returns ``None`` if the analyzer fails or the count cannot be parsed.
+
+    Parameters
+    ----------
+    colmap_bin:
+        Path to the colmap binary.
+    model_dir:
+        Path to the sparse sub-model directory (e.g. ``sfm/sparse/0/``).
+
+    Returns
+    -------
+    Optional[int]
+        Number of registered images, or ``None`` on failure.
+    """
+    # COLMAP 4.x model_analyzer uses --path (not --input_path)
+    cmd = [str(colmap_bin), "model_analyzer", "--path", str(model_dir)]
+    log_info(f"Analyzing sparse model: {model_dir.name}  ({' '.join(cmd[:3])} …)")
+
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        log_warning(f"model_analyzer timed out for {model_dir}")
+        return None
+    except Exception as exc:
+        log_warning(f"model_analyzer failed for {model_dir}: {exc}")
+        return None
+
+    output = result.stdout + result.stderr
+
+    if result.returncode != 0:
+        log_warning(
+            f"model_analyzer exited with code {result.returncode} for {model_dir}.\n"
+            f"  Output: {output[:500]}"
+        )
+        # Still try to parse — COLMAP writes to stderr and may exit non-zero
+        # even when the analysis succeeded.
+
+    # Prefer "Registered images: N" — this is the count of images that were
+    # actually localised in the reconstruction, which is what we want to
+    # maximise when choosing between sub-models.
+    # Example output line: "I20260406 22:32:40.215594 12804 model.cc:441] Registered images: 398"
+    match = re.search(r"(?i)registered\s+images\s*:\s*(\d+)", output)
+    if match:
+        count = int(match.group(1))
+        log_info(f"  Model {model_dir.name}: {count} registered images")
+        return count
+
+    # Fallback: try bare "Images: N" for older COLMAP versions that don't
+    # distinguish registered vs total.
+    match = re.search(r"(?i)(?<!registered\s)images\s*:\s*(\d+)", output)
+    if match:
+        count = int(match.group(1))
+        log_info(f"  Model {model_dir.name}: {count} images (fallback parse)")
+        return count
+
+    log_warning(
+        f"Could not parse image count from model_analyzer output for {model_dir}.\n"
+        f"  Output snippet: {output[:300]}"
+    )
+    return None
+
+
+def select_best_sparse_model(
+    colmap_bin: Path,
+    sparse_parent: Path,
+) -> Path:
+    """Select the sparse sub-model with the most registered images.
+
+    Algorithm
+    ---------
+    1. Enumerate all valid sub-model directories under *sparse_parent*.
+    2. If only one exists, return it directly (no analysis needed).
+    3. Run ``colmap model_analyzer`` on each candidate.
+    4. Return the directory whose analyzer reports the highest image count.
+    5. If analysis fails for all candidates, fall back to the first sub-model
+       with a warning.
+    6. If no sub-models exist at all, return ``sparse_parent / "0"`` and
+       let the caller handle the missing-model error.
+
+    Parameters
+    ----------
+    colmap_bin:
+        Path to the colmap binary.
+    sparse_parent:
+        The ``sfm/sparse/`` directory.
+
+    Returns
+    -------
+    Path
+        Absolute path to the best sparse sub-model directory.
+    """
+    models = enumerate_sparse_models(sparse_parent)
+
+    if not models:
+        log_warning(
+            f"No sparse sub-models found under {sparse_parent}.\n"
+            "  Falling back to sparse/0/ — this may not exist."
+        )
+        return sparse_parent / "0"
+
+    if len(models) == 1:
+        log_info(f"Single sparse model found: {models[0].name} — using it directly.")
+        return models[0]
+
+    log_info(
+        f"Multiple sparse models found under {sparse_parent}: "
+        f"{[m.name for m in models]}.\n"
+        "  Running model_analyzer to select the best one …"
+    )
+
+    best_dir: Optional[Path] = None
+    best_count: int = -1
+
+    for model_dir in models:
+        count = analyze_sparse_model(colmap_bin, model_dir)
+        if count is not None and count > best_count:
+            best_count = count
+            best_dir = model_dir
+
+    if best_dir is None:
+        # All analyses failed — fall back to the first model
+        log_warning(
+            "model_analyzer failed for all sparse sub-models.\n"
+            f"  Falling back to {models[0]} (first sub-model)."
+        )
+        return models[0]
+
+    log_success(
+        f"Selected sparse model: {best_dir.name}  "
+        f"({best_count} registered images — highest among {len(models)} candidates)"
+    )
+    return best_dir
+
+
+# ---------------------------------------------------------------------------
 # Public API: run_sfm
 # ---------------------------------------------------------------------------
 
@@ -472,7 +683,8 @@ def run_sfm(
     # Ensure SfM output directories exist
     sfm_dir = ensure_dir(project.sfm_dir)
     sparse_parent = ensure_dir(project.sfm_dir / "sparse")
-    sparse_dir = ensure_dir(project.sparse_dir)  # sparse/0/
+    # Note: we do NOT pre-create sparse/0/ here — the mapper creates its own
+    # numbered sub-directories.  Pre-creating sparse/0/ can confuse GLOMAP.
 
     database_path = sfm_dir / "database.db"
 
@@ -494,8 +706,11 @@ def run_sfm(
         )
         raise
 
-    # Count registered cameras
-    camera_count = count_registered_cameras(sparse_dir)
+    # Select the best sparse sub-model (the one with the most registered images)
+    best_sparse_dir = select_best_sparse_model(colmap_bin, sparse_parent)
+
+    # Count registered cameras in the selected model
+    camera_count = count_registered_cameras(best_sparse_dir)
 
     if camera_count == 0:
         log_warning(
@@ -507,20 +722,24 @@ def run_sfm(
         )
         status = "failed"
     else:
-        log_success(f"SfM complete — {camera_count} cameras registered.")
+        log_success(
+            f"SfM complete — {camera_count} cameras registered "
+            f"(model: {best_sparse_dir})."
+        )
         status = "completed"
 
-    # Update project.json
+    # Update project.json — store the path to the best model
     project.update_after_sfm(
         sfm_method=method,
         sfm_status=status,  # type: ignore[arg-type]
         camera_count=camera_count,
+        sparse_model_dir=str(best_sparse_dir.relative_to(project.root)),
     )
 
     return SfmResult(
         status=status,
         camera_count=camera_count,
-        sparse_dir=sparse_dir,
+        sparse_dir=best_sparse_dir,
     )
 
 

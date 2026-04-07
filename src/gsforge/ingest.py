@@ -4,32 +4,36 @@ gsforge/ingest.py — Frame extraction for VP workflows.
 Supported inputs
 ----------------
 * **MP4 / MOV video files** — treated as a single video; frames are extracted
-  with FFmpeg using VP-tuned smart downsampling (see below).
+  with FFmpeg using user-directed even sampling (see below).
 * **Image sequences** — the user provides the *first* frame of a numbered
   sequence (e.g. ``frame_001.exr``).  gsforge detects the sibling frames
   automatically from the filename pattern, copies them into ``source/``, and
   re-exports them as numbered PNGs into ``preprocess/``.
 
-Why smart downsampling matters for VP workflows (video path)
-------------------------------------------------------------
-A typical VP shoot records at 24–60 fps.  Feeding every frame to COLMAP or
-GLOMAP is counterproductive:
+User-directed frame count selection
+------------------------------------
+The user explicitly requests how many images to extract/use via
+``--num-images``.  The system samples evenly across the full sequence so
+temporal coverage is maximised.
 
-  1. Near-duplicate frames add almost no new information for SfM — the camera
-     barely moves between consecutive frames at 24 fps.
-  2. Feature extraction (SIFT/SuperPoint) is the bottleneck: it scales linearly
-     with image count.  400 frames → ~2 min; 4 000 frames → ~20 min.
-  3. GLOMAP's global bundle adjustment memory usage grows quadratically with
-     image count.  Keeping it under ~500 images is strongly recommended.
+  * If the source has **more** frames than requested, frames are sampled at
+    a uniform stride: ``stride = total_frames / num_images``.  The selected
+    indices are spread as evenly as possible across the full sequence using
+    ``round(i * stride)`` for i in 0..num_images-1, avoiding clustering at
+    the start.
+  * If the source has **fewer** frames than requested, all frames are used
+    and the user is informed via a warning message.
+  * Edge cases handled: num_images=1, num_images==total, num_images>total,
+    tiny sequences (2 frames), and any integer num_images > 0.
 
-Our strategy (video path)
--------------------------
-  1. Probe the video with FFprobe to get duration and native FPS.
-  2. Compute how many frames we'd get at --target-fps.
-  3. If that count exceeds --max-frames, compute a sparser interval so we
-     extract exactly max_frames evenly spaced across the clip.
-  4. Use FFmpeg's ``fps`` filter with the computed interval to extract
-     only the frames we need — no intermediate full extraction.
+Video path
+----------
+  1. Probe the video with FFprobe to get duration, native FPS, and total
+     frame count.
+  2. Compute the target frame count (clamped to available frames if needed).
+  3. Select ``num_images`` frame indices evenly distributed across the clip.
+  4. Use FFmpeg's ``select`` filter with the computed indices to extract
+     exactly the frames we need — no intermediate full extraction.
   5. Optionally scale frames down with FFmpeg's ``scale`` filter (--downscale).
 
 Image-sequence path
@@ -37,7 +41,7 @@ Image-sequence path
   1. Parse the stem of the provided first frame to extract a numeric suffix.
   2. Glob the parent directory for siblings matching the same prefix + digits.
   3. Sort numerically; require at least 2 matching frames.
-  4. Apply --max-frames cap (evenly spaced subsample if needed).
+  4. Apply ``num_images`` even-stride subsampling if needed.
   5. Copy selected frames into ``source/`` and re-export as ``frame_NNNNNN.png``
      into ``preprocess/`` using Pillow (already a project dependency).
   6. Apply --downscale via Pillow's Lanczos resampler if requested.
@@ -64,9 +68,8 @@ from PIL import Image
 
 from gsforge.utils import (
     DEFAULT_DOWNSCALE,
-    DEFAULT_MAX_FRAMES,
+    DEFAULT_NUM_IMAGES,
     DEFAULT_SEQUENCE_FPS,
-    DEFAULT_TARGET_FPS,
     FRAME_TEMPLATE,
     console,
     ensure_dir,
@@ -224,6 +227,68 @@ def resolve_image_sequence(first_frame: Path) -> list[Path]:
 
 
 # ---------------------------------------------------------------------------
+# Even-stride frame selection — the core sampling logic
+# ---------------------------------------------------------------------------
+
+
+def select_frames_evenly(total_frames: int, num_images: int) -> list[int]:
+    """Select *num_images* frame indices evenly distributed across *total_frames*.
+
+    This is the authoritative sampling function used by both the video path
+    (to build an FFmpeg ``select`` expression) and the image-sequence path
+    (to pick which source frames to copy).
+
+    Algorithm
+    ---------
+    Uses a floating-point stride so that selected indices are spread as
+    uniformly as possible across the full range [0, total_frames-1]:
+
+        stride = total_frames / num_images
+        indices = [round(i * stride) for i in range(num_images)]
+
+    This avoids the clustering-at-start bias of integer-stride approaches
+    (e.g. ``frames[::stride]``) and handles non-integer ratios cleanly.
+
+    Edge cases
+    ----------
+    * ``num_images >= total_frames``: returns ``list(range(total_frames))``.
+    * ``num_images == 1``: returns ``[0]`` (first frame).
+    * ``num_images == total_frames``: returns all indices in order.
+    * ``total_frames == 0``: returns ``[]``.
+
+    Parameters
+    ----------
+    total_frames:
+        Total number of source frames available.
+    num_images:
+        Desired number of output frames.
+
+    Returns
+    -------
+    list[int]
+        Sorted list of 0-based frame indices to select.  Length is
+        ``min(num_images, total_frames)``.
+    """
+    if total_frames <= 0 or num_images <= 0:
+        return []
+
+    if num_images >= total_frames:
+        return list(range(total_frames))
+
+    stride = total_frames / num_images
+    indices = []
+    seen: set[int] = set()
+    for i in range(num_images):
+        idx = min(round(i * stride), total_frames - 1)
+        # Deduplicate in the rare case rounding produces the same index twice
+        if idx not in seen:
+            seen.add(idx)
+            indices.append(idx)
+
+    return sorted(indices)
+
+
+# ---------------------------------------------------------------------------
 # Video probe helpers
 # ---------------------------------------------------------------------------
 
@@ -256,8 +321,8 @@ def probe_video(video_path: Path) -> dict:
     return probe  # type: ignore[return-value]
 
 
-def get_video_info(video_path: Path) -> tuple[float, float, int, int]:
-    """Return (duration_seconds, native_fps, width, height) for a video file.
+def get_video_info(video_path: Path) -> tuple[float, float, int, int, int]:
+    """Return (duration_seconds, native_fps, width, height, total_frames) for a video.
 
     We look for the first video stream in the ffprobe output.
 
@@ -269,7 +334,9 @@ def get_video_info(video_path: Path) -> tuple[float, float, int, int]:
     Returns
     -------
     tuple
-        (duration_s, native_fps, width, height)
+        (duration_s, native_fps, width, height, total_frames)
+        ``total_frames`` is derived from duration × native_fps and may be
+        approximate for VFR sources; it is used only for sampling planning.
     """
     probe = probe_video(video_path)
 
@@ -308,76 +375,11 @@ def get_video_info(video_path: Path) -> tuple[float, float, int, int]:
     if width == 0 or height == 0:
         log_error(f"Cannot determine resolution of '{video_path.name}'.")
 
-    return duration_s, native_fps, width, height
+    # Derive total frame count from duration × native_fps.
+    # ffprobe's nb_frames field is unreliable for many container formats.
+    total_frames = int(math.floor(duration_s * native_fps))
 
-
-# ---------------------------------------------------------------------------
-# Frame interval calculation — the core VP-tuned logic (video path)
-# ---------------------------------------------------------------------------
-
-
-def compute_frame_interval(
-    duration_s: float,
-    native_fps: float,
-    target_fps: int,
-    max_frames: int,
-) -> tuple[float, int]:
-    """Compute the FFmpeg frame selection interval and expected frame count.
-
-    This is the heart of the smart downsampling logic.
-
-    Strategy
-    --------
-    1. Compute ``naive_count`` = how many frames we'd get at ``target_fps``.
-    2. If ``naive_count <= max_frames``, use ``target_fps`` directly.
-    3. Otherwise, compute a sparser interval so we get exactly ``max_frames``
-       evenly distributed across the clip.
-
-    The FFmpeg ``fps`` filter accepts a target FPS value directly, so we
-    convert: ``effective_fps = max_frames / duration_s`` when capping.
-
-    Parameters
-    ----------
-    duration_s:
-        Video duration in seconds.
-    native_fps:
-        Native frame rate of the video stream.
-    target_fps:
-        Desired extraction rate (frames per second of video).
-    max_frames:
-        Hard cap on total extracted frames.
-
-    Returns
-    -------
-    tuple
-        (interval_frames, expected_count) where ``interval_frames`` is the
-        FFmpeg select interval (keep 1 frame every N source frames) and
-        ``expected_count`` is the approximate number of frames that will be
-        written.
-    """
-    # How many frames would we get at the requested fps?
-    naive_count = int(duration_s * target_fps)
-
-    if naive_count <= max_frames:
-        # Happy path: target_fps is fine as-is
-        effective_fps = float(target_fps)
-        expected_count = naive_count
-    else:
-        # We'd exceed max_frames — compute a sparser effective fps
-        # so we get exactly max_frames spread evenly across the clip.
-        effective_fps = max_frames / duration_s
-        expected_count = max_frames
-        log_info(
-            f"At {target_fps} fps this clip would yield {naive_count} frames "
-            f"(exceeds --max-frames={max_frames}).\n"
-            f"  Adjusting to {effective_fps:.2f} fps → ~{expected_count} frames."
-        )
-
-    # Convert effective fps to a source-frame interval for FFmpeg's select filter.
-    # e.g. native=24, effective=5 → interval=4.8 → keep every ~5th source frame.
-    interval_frames = native_fps / effective_fps
-
-    return interval_frames, expected_count
+    return duration_s, native_fps, width, height, total_frames
 
 
 # ---------------------------------------------------------------------------
@@ -388,16 +390,44 @@ def compute_frame_interval(
 def _build_ffmpeg_command(
     video_path: Path,
     output_pattern: Path,
-    effective_fps: float,
+    selected_indices: list[int],
     downscale: int,
     width: int,
     height: int,
 ) -> list[str]:
+    """Build the FFmpeg command to extract exactly the requested frame indices.
+
+    Uses FFmpeg's ``select`` filter with an expression that matches only the
+    0-based frame numbers in *selected_indices*.  This avoids extracting all
+    frames to disk and then deleting the unwanted ones.
+
+    Parameters
+    ----------
+    video_path:
+        Source video file.
+    output_pattern:
+        Output filename pattern (e.g. ``preprocess/frame_%06d.png``).
+    selected_indices:
+        Sorted list of 0-based frame indices to extract.
+    downscale:
+        Spatial downscale factor (1 = full resolution).
+    width, height:
+        Native video resolution (used to compute downscaled dimensions).
+    """
     filters: list[str] = []
 
-    # Use the 'fps' filter. It handles all the 'mod' math for you
-    # and ensures frames are picked at even time intervals.
-    filters.append(f"fps={round(effective_fps, 4)}")
+    # Build a select expression: eq(n,0)+eq(n,5)+eq(n,10)+...
+    # FFmpeg evaluates this per-frame; only frames where the expression is
+    # non-zero are passed through.
+    if selected_indices:
+        select_expr = "+".join(f"eq(n\\,{idx})" for idx in selected_indices)
+        filters.append(f"select='{select_expr}'")
+        # vsync=0 (or vfr) prevents FFmpeg from duplicating frames to fill
+        # gaps in the selected set.
+        vsync_flag = ["-vsync", "0"]
+    else:
+        # Fallback: extract all frames (should not happen in normal usage)
+        vsync_flag = []
 
     if downscale > 1:
         out_w = (width // downscale) & ~1
@@ -417,8 +447,9 @@ def _build_ffmpeg_command(
         "1",
         "-start_number",
         "1",
-        str(output_pattern),
     ]
+    cmd.extend(vsync_flag)
+    cmd.append(str(output_pattern))
     return cmd
 
 
@@ -490,15 +521,16 @@ def ingest_image_sequence(
     project: "GSProject",  # type: ignore[name-defined]
     frames: list[Path],
     downscale: int = DEFAULT_DOWNSCALE,
-    max_frames: int = DEFAULT_MAX_FRAMES,
+    num_images: int = DEFAULT_NUM_IMAGES,
     sequence_fps: int = DEFAULT_SEQUENCE_FPS,
 ) -> IngestResult:
     """Copy and re-export an image sequence into the project's preprocess/ directory.
 
     Steps
     -----
-    1. Apply ``max_frames`` cap: if ``len(frames) > max_frames``, subsample
-       evenly using a stride so we keep the best temporal spread.
+    1. Apply ``num_images`` even-stride subsampling: if ``len(frames) > num_images``,
+       select frames evenly distributed across the full sequence.
+       If ``len(frames) < num_images``, use all frames and warn the user.
     2. Copy selected source frames into ``project/source/`` for self-containment.
     3. Re-export each frame as ``frame_NNNNNN.png`` into ``project/preprocess/``,
        applying ``downscale`` via Pillow's Lanczos resampler if requested.
@@ -513,8 +545,10 @@ def ingest_image_sequence(
         Sorted list of source frame paths (from ``resolve_image_sequence``).
     downscale:
         Spatial downscale factor (1 = full resolution).
-    max_frames:
-        Hard cap on total frames written to preprocess/.
+    num_images:
+        Target number of frames to extract.  Frames are sampled evenly across
+        the full sequence.  If the source has fewer frames than requested, all
+        frames are used and the user is warned.
     sequence_fps:
         Assumed frame rate of the sequence (used for ``effective_fps`` reporting
         and stored in project.json).  Does not affect which frames are selected.
@@ -526,17 +560,30 @@ def ingest_image_sequence(
     """
     total_available = len(frames)
 
-    # Apply max_frames cap via even stride
-    if total_available > max_frames:
-        stride = math.ceil(total_available / max_frames)
-        selected = frames[::stride][:max_frames]
+    # Determine which frames to use
+    if total_available > num_images:
+        # Even-stride subsampling across the full sequence
+        indices = select_frames_evenly(total_available, num_images)
+        selected = [frames[i] for i in indices]
         log_info(
-            f"Image sequence has {total_available} frames "
-            f"(exceeds --max-frames={max_frames}).\n"
-            f"  Subsampling every {stride} frames → {len(selected)} frames."
+            f"Image sequence: {total_available} frames available, "
+            f"{len(selected)} requested → selecting {len(selected)} evenly spaced frames."
+        )
+    elif total_available < num_images:
+        # User requested more frames than exist — use all and warn
+        selected = frames
+        log_warning(
+            f"Requested {num_images} images but the sequence only has "
+            f"{total_available} frames.\n"
+            f"  Using all {total_available} available frames instead."
         )
     else:
+        # Exact match — use all frames
         selected = frames
+        log_info(
+            f"Image sequence: {total_available} frames available, "
+            f"{num_images} requested → using all frames."
+        )
 
     log_info(
         f"Image sequence: {len(selected)} frames selected from {total_available} available."
@@ -599,8 +646,7 @@ def ingest_image_sequence(
     project.update_after_ingest(
         input_type="images",
         input_path=relative_source,
-        target_fps=sequence_fps,
-        max_frames=max_frames,
+        num_images_requested=num_images,
         downscale=downscale,
         num_extracted_frames=num_written,
     )
@@ -621,8 +667,7 @@ def ingest_image_sequence(
 def extract_frames(
     project: "GSProject",  # type: ignore[name-defined]  # avoid circular import
     input_path: Path,
-    target_fps: int = DEFAULT_TARGET_FPS,
-    max_frames: int = DEFAULT_MAX_FRAMES,
+    num_images: int = DEFAULT_NUM_IMAGES,
     downscale: int = DEFAULT_DOWNSCALE,
     sequence_fps: int = DEFAULT_SEQUENCE_FPS,
 ) -> IngestResult:
@@ -632,19 +677,25 @@ def extract_frames(
     input, then dispatches to either the video (FFmpeg) path or the
     image-sequence (Pillow) path.
 
+    The ``num_images`` parameter is the single authoritative control for how
+    many frames are extracted.  Frames are always sampled evenly across the
+    full source sequence to maximise temporal coverage.
+
     Video path steps
     ----------------
-    1. Probe the video to get duration, native FPS, and resolution.
-    2. Compute the optimal frame interval (smart downsampling).
-    3. Copy the source file into ``project/source/``.
-    4. Run FFmpeg to extract frames into ``project/preprocess/``.
-    5. Count the actual frames written.
-    6. Update ``project.json`` via ``project.update_after_ingest()``.
+    1. Probe the video to get duration, native FPS, total frames, and resolution.
+    2. Determine the actual frame count to extract (clamped to available frames
+       if num_images > total_frames, with a warning).
+    3. Compute evenly-spaced frame indices using ``select_frames_evenly()``.
+    4. Copy the source file into ``project/source/``.
+    5. Run FFmpeg with a ``select`` filter to extract exactly those frames.
+    6. Count the actual frames written.
+    7. Update ``project.json`` via ``project.update_after_ingest()``.
 
     Image-sequence path steps
     -------------------------
     1. Resolve all sibling frames from the provided first frame.
-    2. Apply max_frames cap.
+    2. Apply num_images even-stride subsampling (or warn if over-requested).
     3. Copy source frames into ``project/source/``.
     4. Re-export as ``frame_NNNNNN.png`` into ``project/preprocess/``.
     5. Update ``project.json`` via ``project.update_after_ingest()``.
@@ -656,12 +707,10 @@ def extract_frames(
     input_path:
         Absolute path to the source file — a video (.mp4, .mov) or the first
         frame of a numbered image sequence (.png, .jpg, .jpeg, .tif, .tiff, .exr).
-    target_fps:
-        Desired extraction rate for video files (frames per second of video).
-        Ignored for image sequences.
-    max_frames:
-        Hard cap on total extracted frames.  Applied to both video and sequence
-        inputs.
+    num_images:
+        Target number of images to extract.  Frames are sampled evenly across
+        the full source sequence.  If the source has fewer frames than requested,
+        all frames are used and the user is warned.
     downscale:
         Spatial downscale factor (1 = full resolution).
     sequence_fps:
@@ -694,7 +743,7 @@ def extract_frames(
             project=project,
             frames=frames,
             downscale=downscale,
-            max_frames=max_frames,
+            num_images=num_images,
             sequence_fps=sequence_fps,
         )
 
@@ -709,43 +758,40 @@ def extract_frames(
         )
 
     log_step("Probing source file", str(input_path.name))
-    duration_s, native_fps, width, height = get_video_info(input_path)
+    duration_s, native_fps, width, height, total_frames = get_video_info(input_path)
 
     log_info(
         f"Source: {input_path.name}  |  "
         f"Duration: {duration_s:.1f}s  |  "
         f"Native FPS: {native_fps:.3f}  |  "
-        f"Resolution: {width}x{height}"
+        f"Resolution: {width}x{height}  |  "
+        f"Total frames: ~{total_frames}"
     )
 
     # Validate inputs
-    if target_fps <= 0:
-        log_error(f"--target-fps must be > 0, got {target_fps}.")
-    if max_frames <= 0:
-        log_error(f"--max-frames must be > 0, got {max_frames}.")
+    if num_images <= 0:
+        log_error(f"--num-images must be > 0, got {num_images}.")
     if downscale < 1:
         log_error(f"--downscale must be >= 1, got {downscale}.")
 
-    # Warn if target_fps > native_fps — we can't extract more frames than exist
-    if target_fps > native_fps:
+    # Handle over-request: user asked for more frames than the video has
+    if num_images > total_frames:
         log_warning(
-            f"--target-fps ({target_fps}) > native FPS ({native_fps:.2f}).\n"
-            f"  Clamping to native FPS."
+            f"Requested {num_images} images but the video only has ~{total_frames} frames "
+            f"({duration_s:.1f}s at {native_fps:.2f} fps).\n"
+            f"  Using all ~{total_frames} available frames instead."
         )
-        target_fps = int(math.floor(native_fps))
+        actual_num_images = total_frames
+    else:
+        actual_num_images = num_images
 
-    # Compute frame interval
-    interval_frames, expected_count = compute_frame_interval(
-        duration_s=duration_s,
-        native_fps=native_fps,
-        target_fps=target_fps,
-        max_frames=max_frames,
-    )
+    # Compute evenly-spaced frame indices
+    selected_indices = select_frames_evenly(total_frames, actual_num_images)
+    expected_count = len(selected_indices)
 
     log_info(
-        f"Extraction plan: ~{expected_count} frames  |  "
-        f"Interval: every {interval_frames:.1f} source frames  |  "
-        f"Effective FPS: {native_fps / interval_frames:.2f}"
+        f"Extraction plan: {expected_count} frames selected from ~{total_frames} total  |  "
+        f"Stride: ~{total_frames / max(expected_count, 1):.1f} source frames per output frame"
     )
 
     # Ensure output directory exists
@@ -768,7 +814,7 @@ def extract_frames(
     cmd = _build_ffmpeg_command(
         video_path=input_path,
         output_pattern=output_pattern,
-        effective_fps=native_fps / interval_frames,
+        selected_indices=selected_indices,
         downscale=downscale,
         width=width,
         height=height,
@@ -777,7 +823,7 @@ def extract_frames(
     _run_ffmpeg(cmd, expected_frames=expected_count)
 
     # Count actual frames written (ground truth — FFmpeg may write slightly
-    # more or fewer than expected due to rounding in the fps filter)
+    # more or fewer than expected due to rounding in the select filter)
     actual_frames = sorted(preprocess_dir.glob("frame_*.png"))
     num_frames = len(actual_frames)
 
@@ -807,8 +853,7 @@ def extract_frames(
     project.update_after_ingest(
         input_type="video",
         input_path=relative_source,
-        target_fps=target_fps,
-        max_frames=max_frames,
+        num_images_requested=num_images,
         downscale=downscale,
         num_extracted_frames=num_frames,
     )

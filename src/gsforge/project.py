@@ -85,8 +85,10 @@ class ProjectMeta:
     # --- Set after ingest ---
     input_type: Optional[InputType] = None
     input_path: Optional[str] = None  # relative path inside project dir
-    target_fps: Optional[int] = None
-    max_frames: Optional[int] = None
+    # num_images_requested: the number of images the user asked for.
+    # Replaces the old target_fps + max_frames pair.  The actual extracted
+    # count may differ (e.g. source had fewer frames than requested).
+    num_images_requested: Optional[int] = None
     downscale: Optional[int] = None
     num_extracted_frames: Optional[int] = None
 
@@ -94,6 +96,9 @@ class ProjectMeta:
     sfm_method: Optional[SfmMethod] = None
     sfm_status: Optional[PipelineStatus] = None
     camera_count: Optional[int] = None
+    # Path to the best sparse sub-model selected after SfM, relative to project root.
+    # e.g. "sfm/sparse/0" or "sfm/sparse/2" (the model with the most registered images).
+    sparse_model_dir: Optional[str] = None
 
     # --- Set after training ---
     training_status: Optional[PipelineStatus] = None
@@ -133,7 +138,7 @@ class GSProject:
     project = GSProject.from_path(Path("MyVPScene.gsproject"))
 
     # Update metadata after a pipeline step:
-    project.update_after_ingest(num_frames=312, target_fps=5, ...)
+    project.update_after_ingest(num_frames=312, num_images_requested=300, ...)
     """
 
     def __init__(self, root: Path, meta: ProjectMeta) -> None:
@@ -192,8 +197,11 @@ class GSProject:
         for subfolder in SUBFOLDERS:
             (project_dir / subfolder).mkdir()
 
-        # Also create the nested sfm/sparse/0/ structure that COLMAP expects
-        (project_dir / "sfm" / "sparse" / "0").mkdir(parents=True)
+        # Create sfm/sparse/ but NOT sfm/sparse/0/ — the COLMAP mapper creates
+        # its own numbered sub-directories (0/, 1/, …).  Pre-creating sparse/0/
+        # can confuse GLOMAP's global mapper.  import-colmap creates sparse/0/
+        # itself via ensure_dir(project.sparse_dir).
+        (project_dir / "sfm" / "sparse").mkdir(parents=True)
 
         # Initialise metadata
         meta = ProjectMeta(name=safe_name)
@@ -277,8 +285,27 @@ class GSProject:
 
     @property
     def sparse_dir(self) -> Path:
-        """Standard COLMAP sparse/0/ directory inside sfm/."""
+        """Standard COLMAP sparse/0/ directory inside sfm/.
+
+        This is the *default* sub-model path used when no SfM has been run yet
+        (e.g. for ``import-colmap`` which always writes to sparse/0/).
+        For the *best* model selected after a full SfM run, use
+        ``best_sparse_dir`` instead.
+        """
         return self.root / "sfm" / "sparse" / "0"
+
+    @property
+    def best_sparse_dir(self) -> Path:
+        """Path to the best sparse sub-model selected after SfM.
+
+        If ``project.json`` records a ``sparse_model_dir`` (set by
+        ``update_after_sfm``), that path is returned.  Otherwise falls back
+        to ``sparse/0/`` for backward compatibility with projects created
+        before this field was introduced.
+        """
+        if self.meta.sparse_model_dir is not None:
+            return self.root / self.meta.sparse_model_dir
+        return self.sparse_dir
 
     @property
     def models_dir(self) -> Path:
@@ -309,10 +336,14 @@ class GSProject:
 
         Useful when loading a project that was created by an older version of
         gsforge that didn't have all the subdirectories.
+
+        Note: creates ``sfm/sparse/`` but NOT ``sfm/sparse/0/`` — the mapper
+        creates its own numbered sub-directories.
         """
         for subfolder in SUBFOLDERS:
             ensure_dir(self.root / subfolder)
-        ensure_dir(self.sparse_dir)
+        # Ensure sfm/sparse/ exists (parent of sub-models), but not sparse/0/
+        ensure_dir(self.root / "sfm" / "sparse")
 
     # ------------------------------------------------------------------
     # Metadata update helpers — called by pipeline steps
@@ -323,8 +354,7 @@ class GSProject:
         *,
         input_type: InputType,
         input_path: str,
-        target_fps: int,
-        max_frames: int,
+        num_images_requested: int,
         downscale: int,
         num_extracted_frames: int,
     ) -> None:
@@ -334,8 +364,7 @@ class GSProject:
         """
         self.meta.input_type = input_type
         self.meta.input_path = input_path
-        self.meta.target_fps = target_fps
-        self.meta.max_frames = max_frames
+        self.meta.num_images_requested = num_images_requested
         self.meta.downscale = downscale
         self.meta.num_extracted_frames = num_extracted_frames
         self.save()
@@ -347,14 +376,23 @@ class GSProject:
         sfm_method: SfmMethod,
         sfm_status: PipelineStatus,
         camera_count: int,
+        sparse_model_dir: Optional[str] = None,
     ) -> None:
         """Record SfM results in project.json.
 
         Called by ``gsforge/sfm.py`` after reconstruction completes (or fails).
+
+        Parameters
+        ----------
+        sparse_model_dir:
+            Path to the best sparse sub-model, relative to the project root
+            (e.g. ``"sfm/sparse/0"``).  If ``None``, the field is not updated.
         """
         self.meta.sfm_method = sfm_method
         self.meta.sfm_status = sfm_status
         self.meta.camera_count = camera_count
+        if sparse_model_dir is not None:
+            self.meta.sparse_model_dir = sparse_model_dir
         self.save()
         log_info(f"project.json updated — SfM {sfm_status} ({camera_count} cameras).")
 
@@ -402,11 +440,10 @@ class GSProject:
             "Created": self.meta.created,
             "Input type": _fmt(self.meta.input_type),
             "Input path": _fmt(self.meta.input_path),
-            "Target FPS": _fmt(
-                str(self.meta.target_fps) if self.meta.target_fps else None
-            ),
-            "Max frames": _fmt(
-                str(self.meta.max_frames) if self.meta.max_frames else None
+            "Images requested": _fmt(
+                str(self.meta.num_images_requested)
+                if self.meta.num_images_requested is not None
+                else None
             ),
             "Downscale": _fmt(
                 str(self.meta.downscale) if self.meta.downscale else None
@@ -419,6 +456,7 @@ class GSProject:
                 if self.meta.camera_count is not None
                 else None
             ),
+            "Sparse model": _fmt(self.meta.sparse_model_dir),
             "Training status": _fmt(self.meta.training_status),
             "Final PLY": _fmt(self.meta.final_ply),
             "Last iteration": _fmt(

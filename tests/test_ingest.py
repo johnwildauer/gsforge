@@ -5,7 +5,8 @@ Coverage
 --------
 * classify_input()          — MP4, MOV, PNG, unsupported extension
 * resolve_image_sequence()  — happy path, no digits, only one frame, prefix isolation
-* ingest_image_sequence()   — end-to-end copy+rename, max_frames cap, downscale
+* select_frames_evenly()    — even distribution, edge cases (1, equal, over-request, tiny)
+* ingest_image_sequence()   — end-to-end copy+rename, num_images sampling, downscale
 * extract_frames()          — dispatch to video path (MP4/MOV) and sequence path
 
 Design notes
@@ -36,8 +37,9 @@ from gsforge.ingest import (
     extract_frames,
     ingest_image_sequence,
     resolve_image_sequence,
+    select_frames_evenly,
 )
-from gsforge.utils import DEFAULT_SEQUENCE_FPS
+from gsforge.utils import DEFAULT_NUM_IMAGES, DEFAULT_SEQUENCE_FPS
 
 
 # ---------------------------------------------------------------------------
@@ -204,6 +206,88 @@ class TestResolveImageSequence:
 
 
 # ---------------------------------------------------------------------------
+# select_frames_evenly — the core sampling function
+# ---------------------------------------------------------------------------
+
+
+class TestSelectFramesEvenly:
+    def test_empty_source_returns_empty(self) -> None:
+        assert select_frames_evenly(0, 10) == []
+
+    def test_zero_requested_returns_empty(self) -> None:
+        assert select_frames_evenly(100, 0) == []
+
+    def test_request_one_returns_first_frame(self) -> None:
+        result = select_frames_evenly(100, 1)
+        assert result == [0]
+
+    def test_request_equals_total_returns_all(self) -> None:
+        result = select_frames_evenly(5, 5)
+        assert result == [0, 1, 2, 3, 4]
+
+    def test_request_greater_than_total_returns_all(self) -> None:
+        result = select_frames_evenly(5, 1000)
+        assert result == [0, 1, 2, 3, 4]
+
+    def test_even_distribution_no_clustering_at_start(self) -> None:
+        """1000 frames, request 200 → every 5th frame, evenly spread."""
+        result = select_frames_evenly(1000, 200)
+        assert len(result) == 200
+        # First index should be 0, last should be near 999
+        assert result[0] == 0
+        assert result[-1] >= 990  # last selected frame is near the end
+        # Gaps between consecutive selected frames should be approximately equal
+        gaps = [result[i + 1] - result[i] for i in range(len(result) - 1)]
+        # All gaps should be 4 or 5 (stride ≈ 5.0)
+        assert all(4 <= g <= 6 for g in gaps), f"Unexpected gaps: {set(gaps)}"
+
+    def test_750_from_1000(self) -> None:
+        """1000 frames, request 750 → stride ≈ 1.33, every 1–2 frames."""
+        result = select_frames_evenly(1000, 750)
+        assert len(result) == 750
+        assert result[0] == 0
+        assert result[-1] >= 990
+        # No duplicates
+        assert len(set(result)) == len(result)
+        # Sorted
+        assert result == sorted(result)
+
+    def test_tiny_sequence_two_frames_request_one(self) -> None:
+        result = select_frames_evenly(2, 1)
+        assert result == [0]
+
+    def test_tiny_sequence_two_frames_request_two(self) -> None:
+        result = select_frames_evenly(2, 2)
+        assert result == [0, 1]
+
+    def test_tiny_sequence_two_frames_request_many(self) -> None:
+        result = select_frames_evenly(2, 100)
+        assert result == [0, 1]
+
+    def test_result_is_sorted(self) -> None:
+        result = select_frames_evenly(500, 100)
+        assert result == sorted(result)
+
+    def test_no_duplicates(self) -> None:
+        result = select_frames_evenly(500, 100)
+        assert len(set(result)) == len(result)
+
+    def test_all_indices_in_valid_range(self) -> None:
+        total = 300
+        result = select_frames_evenly(total, 100)
+        assert all(0 <= idx < total for idx in result)
+
+    def test_single_frame_source(self) -> None:
+        """Edge case: only 1 frame available."""
+        result = select_frames_evenly(1, 1)
+        assert result == [0]
+
+    def test_single_frame_source_over_request(self) -> None:
+        result = select_frames_evenly(1, 50)
+        assert result == [0]
+
+
+# ---------------------------------------------------------------------------
 # ingest_image_sequence
 # ---------------------------------------------------------------------------
 
@@ -251,25 +335,60 @@ class TestIngestImageSequence:
 
         assert result.effective_fps == float(DEFAULT_SEQUENCE_FPS)
 
-    def test_max_frames_cap_subsamples(self, tmp_path: Path) -> None:
+    def test_num_images_subsamples_evenly(self, tmp_path: Path) -> None:
         seq_dir = tmp_path / "seq"
         frames = _make_sequence(seq_dir, count=10)
         proj = _make_gsproject(tmp_path)
 
-        result = ingest_image_sequence(project=proj, frames=frames, max_frames=5)
+        result = ingest_image_sequence(project=proj, frames=frames, num_images=5)
 
         output_files = sorted(proj.preprocess_dir.glob("frame_*.png"))
         assert len(output_files) == 5
         assert result.num_frames == 5
 
-    def test_max_frames_no_cap_when_under_limit(self, tmp_path: Path) -> None:
+    def test_num_images_no_cap_when_under_limit(self, tmp_path: Path) -> None:
         seq_dir = tmp_path / "seq"
         frames = _make_sequence(seq_dir, count=4)
         proj = _make_gsproject(tmp_path)
 
-        result = ingest_image_sequence(project=proj, frames=frames, max_frames=10)
+        result = ingest_image_sequence(project=proj, frames=frames, num_images=10)
 
+        # Source has 4 frames, requested 10 → use all 4 (with warning)
         assert result.num_frames == 4
+
+    def test_num_images_over_request_uses_all_frames(self, tmp_path: Path) -> None:
+        """Requesting more images than available should use all frames."""
+        seq_dir = tmp_path / "seq"
+        frames = _make_sequence(seq_dir, count=3)
+        proj = _make_gsproject(tmp_path)
+
+        with patch("gsforge.ingest.log_warning") as mock_warn:
+            result = ingest_image_sequence(project=proj, frames=frames, num_images=1000)
+
+        assert result.num_frames == 3
+        # Should have warned the user
+        mock_warn.assert_called_once()
+        warning_text = mock_warn.call_args[0][0]
+        assert "1000" in warning_text  # requested count mentioned
+        assert "3" in warning_text  # available count mentioned
+
+    def test_num_images_exactly_equal_uses_all(self, tmp_path: Path) -> None:
+        seq_dir = tmp_path / "seq"
+        frames = _make_sequence(seq_dir, count=5)
+        proj = _make_gsproject(tmp_path)
+
+        result = ingest_image_sequence(project=proj, frames=frames, num_images=5)
+
+        assert result.num_frames == 5
+
+    def test_num_images_one_extracts_single_frame(self, tmp_path: Path) -> None:
+        seq_dir = tmp_path / "seq"
+        frames = _make_sequence(seq_dir, count=10)
+        proj = _make_gsproject(tmp_path)
+
+        result = ingest_image_sequence(project=proj, frames=frames, num_images=1)
+
+        assert result.num_frames == 1
 
     def test_downscale_halves_resolution(self, tmp_path: Path) -> None:
         seq_dir = tmp_path / "seq"
@@ -323,6 +442,30 @@ class TestIngestImageSequence:
         proj_reloaded = GSProject.from_path(proj.root)
         assert proj_reloaded.meta.input_type == "images"
         assert proj_reloaded.meta.num_extracted_frames == 3
+
+    def test_project_json_records_num_images_requested(self, tmp_path: Path) -> None:
+        seq_dir = tmp_path / "seq"
+        frames = _make_sequence(seq_dir, count=10)
+        proj = _make_gsproject(tmp_path)
+
+        ingest_image_sequence(project=proj, frames=frames, num_images=5)
+
+        from gsforge.project import GSProject
+
+        proj_reloaded = GSProject.from_path(proj.root)
+        assert proj_reloaded.meta.num_images_requested == 5
+
+    def test_even_distribution_large_sequence(self, tmp_path: Path) -> None:
+        """100 frames, request 10 → every 10th frame, evenly spread."""
+        seq_dir = tmp_path / "seq"
+        frames = _make_sequence(seq_dir, count=100)
+        proj = _make_gsproject(tmp_path)
+
+        result = ingest_image_sequence(project=proj, frames=frames, num_images=10)
+
+        assert result.num_frames == 10
+        output_files = sorted(proj.preprocess_dir.glob("frame_*.png"))
+        assert len(output_files) == 10
 
 
 # ---------------------------------------------------------------------------
@@ -419,6 +562,9 @@ class TestExtractFramesDispatch:
         video.touch()
         proj = _make_gsproject(tmp_path)
 
+        # The mock video is 10s at 24fps → ~240 total frames.
+        # Use num_images=100 (well under 240) so no over-request warning fires,
+        # leaving only the sequence-fps warning to assert on.
         with (
             patch(
                 "gsforge.ingest.ffmpeg.probe", return_value=self._mock_ffprobe_result()
@@ -429,9 +575,11 @@ class TestExtractFramesDispatch:
             result = extract_frames(
                 project=proj,
                 input_path=video,
+                num_images=100,  # well under ~240 available frames
                 sequence_fps=30,  # non-default value — should trigger warning
             )
 
+        # Exactly one warning: the sequence-fps-ignored warning
         mock_warn.assert_called_once()
         assert (
             "sequence-fps" in mock_warn.call_args[0][0].lower()
@@ -458,3 +606,43 @@ class TestExtractFramesDispatch:
 
         with pytest.raises(SystemExit):
             extract_frames(project=proj, input_path=bad_file)
+
+    def test_num_images_stored_in_project_json(self, tmp_path: Path) -> None:
+        """num_images_requested must be persisted in project.json after ingest."""
+        seq_dir = tmp_path / "seq"
+        frames = _make_sequence(seq_dir, count=20)
+        proj = _make_gsproject(tmp_path)
+
+        extract_frames(project=proj, input_path=frames[0], num_images=7)
+
+        from gsforge.project import GSProject
+
+        proj_reloaded = GSProject.from_path(proj.root)
+        assert proj_reloaded.meta.num_images_requested == 7
+
+    def test_video_over_request_warns_and_uses_all(self, tmp_path: Path) -> None:
+        """Requesting more images than video frames should warn and use all frames."""
+        video = tmp_path / "clip.mp4"
+        video.touch()
+        proj = _make_gsproject(tmp_path)
+
+        # 10-second 24fps clip → ~240 total frames; request 9999
+        with (
+            patch(
+                "gsforge.ingest.ffmpeg.probe", return_value=self._mock_ffprobe_result()
+            ),
+            patch(
+                "gsforge.ingest.subprocess.Popen",
+                self._mock_popen(tmp_path, num_frames=5),
+            ),
+            patch("gsforge.ingest.log_warning") as mock_warn,
+        ):
+            result = extract_frames(
+                project=proj,
+                input_path=video,
+                num_images=9999,
+            )
+
+        # Should have warned about over-request
+        warning_calls = [str(c) for c in mock_warn.call_args_list]
+        assert any("9999" in w for w in warning_calls)

@@ -5,18 +5,14 @@ Covers:
   - Rich-based console logging (info, success, warning, error)
   - tqdm progress bar factory
   - Path validation helpers
-  - Shared constants (default FPS, max frames, subfolder names, etc.)
+  - Shared constants (default image count, subfolder names, etc.)
 
 Why these defaults?
-  - DEFAULT_TARGET_FPS = 5: For a typical VP shoot at 24–60 fps, extracting
-    every frame gives thousands of near-identical images. COLMAP/GLOMAP only
-    needs ~60–80% overlap between adjacent frames. At 5 fps you get one frame
-    every 200 ms — plenty of overlap for a slow camera move, and dramatically
-    faster SfM (fewer images = fewer feature matches = less RAM + time).
-  - DEFAULT_MAX_FRAMES = 400: Even at 5 fps a long clip can produce 1000+
-    frames. 300–400 images is the sweet spot for GLOMAP: fast enough to run
-    on a workstation in minutes, dense enough for a high-quality reconstruction.
-    Users can raise this for very large scenes.
+  - DEFAULT_NUM_IMAGES = 300: The user explicitly requests how many images to
+    extract/use from the source.  300 images is the sweet spot for GLOMAP on a
+    workstation: fast enough to run in minutes, dense enough for a high-quality
+    reconstruction.  Users can raise this for very large or complex scenes.
+    If the source has fewer frames than requested, all frames are used.
   - DEFAULT_DOWNSCALE = 1: No downscale by default. Users on tight hardware
     can pass --downscale 2 to halve resolution, which cuts COLMAP feature
     extraction time by ~4x.
@@ -38,13 +34,11 @@ from tqdm import tqdm as _tqdm
 # Constants — VP-tuned defaults
 # ---------------------------------------------------------------------------
 
-#: Extract one frame every N seconds of video (5 fps = 1 frame per 200 ms).
-#: This is the primary knob for controlling how many images COLMAP/GLOMAP sees.
-DEFAULT_TARGET_FPS: int = 5
-
-#: Hard cap on extracted frames. Even at 5 fps a 90-second clip = 450 frames.
-#: Capping at 400 keeps SfM tractable on a single workstation.
-DEFAULT_MAX_FRAMES: int = 400
+#: Default number of images to extract/use from the source.
+#: The user explicitly requests this count; frames are sampled evenly across
+#: the full sequence so temporal coverage is maximised.
+#: 300 is the sweet spot for GLOMAP on a workstation GPU.
+DEFAULT_NUM_IMAGES: int = 300
 
 #: Spatial downscale factor applied to extracted frames (1 = full resolution).
 #: Downscaling by 2 halves width/height, cutting feature extraction time ~4x.
@@ -62,6 +56,8 @@ DEFAULT_TRAIN_ITERATIONS: int = 15_000
 #: Assumed frame rate for image sequences when the user does not specify one.
 #: 24 fps is the standard cinematic frame rate and a safe default for VP
 #: image sequences exported from DCC tools (Nuke, Houdini, Resolve, etc.).
+#: This is used only for reporting (effective_fps in IngestResult) and stored
+#: in project.json; it does NOT affect which frames are selected.
 DEFAULT_SEQUENCE_FPS: int = 24
 
 #: Save a preview render every N training iterations.
