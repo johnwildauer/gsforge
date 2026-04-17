@@ -1,21 +1,21 @@
 # gsforge
 
-**CLI-first 3D Gaussian Splatting for virtual production workflows.**
+**A CLI 3D Gaussian Splatting tool.**
 
-gsforge is an open-source, pipeline-oriented tool that takes you from raw VP footage to a trained 3DGS `.ply` model in a single command. It is designed for technical artists and pipeline TDs who want reproducible, scriptable, and fast reconstructions — not a GUI.
+gsforge is an open-source, pipeline-oriented tool that takes you from raw VP footage to a trained 3DGS `.ply` model in a single command. It is designed for artists who want reproducible, scriptable, and fast reconstructions, without needing to manage the plethora of computational prerequisties for each step of the process.
 
 ---
 
 ## Why gsforge?
 
-| Problem                                 | gsforge solution                                                                  |
-| --------------------------------------- | --------------------------------------------------------------------------------- |
-| COLMAP on raw 24fps footage takes hours | Smart frame downsampling: extract only 5 fps (configurable), capped at 400 frames |
-| Classic COLMAP incremental SfM is slow  | Default to **GLOMAP** (global SfM via COLMAP 4.x) — 5–20× faster                  |
-| Projects are hard to share / move       | Everything lives in a self-contained `MyScene.gsproject/` folder                  |
-| Integrating with other tools is painful | `gsforge export-colmap` produces a standard COLMAP folder any tool can open       |
-| Training scripts are hard to configure  | One command: `gsforge train`                                                      |
-| Can't see training progress             | Preview renders saved every N iterations to `renders/`                            |
+| Problem                                 | gsforge solution                                                            |
+| --------------------------------------- | --------------------------------------------------------------------------- |
+| COLMAP on raw 24fps footage takes hours | Smart frame downsampling: define how many frames you want (defaults to 400) |
+| Classic COLMAP incremental SfM is slow  | Default to **GLOMAP** (global SfM via COLMAP 4.x) — 5–20× faster            |
+| Projects are hard to share / move       | Everything lives in a self-contained `MyScene.gsproject/` folder            |
+| Integrating with other tools is painful | `gsforge export-colmap` produces a standard COLMAP folder any tool can open |
+| Training scripts are hard to configure  | One command: `gsforge train`                                                |
+| Can't see training progress             | Preview renders saved every N iterations to `renders/`                      |
 
 ---
 
@@ -319,18 +319,6 @@ gsforge ingest --input footage.mp4 --downscale 2  # half resolution = ~4x less V
 ```
 
 ---
-
-## Why 5 fps and 400 frames max?
-
-These defaults are tuned for virtual production footage:
-
-**5 fps (default `--target-fps`)**
-
-A typical VP shoot records at 24–60 fps. Consecutive frames at 24 fps are separated by only 42 ms — the camera barely moves. COLMAP/GLOMAP only needs 60–80% overlap between adjacent frames to reconstruct reliably. At 5 fps you get one frame every 200 ms, which gives excellent overlap for any camera speed used in VP (slow dolly, crane, handheld walk). Extracting every frame would give 5–12× more images with almost no additional reconstruction quality, but 5–12× longer feature extraction time.
-
-**400 frames max (default `--max-frames`)**
-
-Even at 5 fps, a 90-second clip produces 450 frames. GLOMAP's global bundle adjustment memory usage grows quadratically with image count. 300–400 images is the sweet spot: fast enough to run on a workstation in 5–15 minutes, dense enough for a high-quality reconstruction of any VP scene. For very large or complex scenes (e.g. full LED volume walk-through), raise this to 600–800.
 
 **Adjusting for your footage**
 
