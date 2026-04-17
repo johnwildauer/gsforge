@@ -152,8 +152,10 @@ bin/
 .env.local
 .env.*.local
 
-
 tests/test_data/*.mp4
 *.mp4
 tests/test_data/*.mov
 
+# pixi environments
+.pixi/*
+!.pixi/config.toml

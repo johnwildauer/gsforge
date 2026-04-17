@@ -21,40 +21,33 @@ gsforge is an open-source, pipeline-oriented tool that takes you from raw VP foo
 
 ## Quick install
 
-### 1. Create a conda environment
+### 1. Install Pixi (one-time only)
 
-If you don't already have `conda` installed, grab either:
+Install Pixi.
 
-- **[Anaconda](https://www.anaconda.com/download)** — full distribution with many pre-installed packages, or
-- **[Miniconda](https://docs.conda.io/en/latest/miniconda.html)** — minimal installer (recommended if you just need `conda`)
+- **Linux/macOS**
 
-Once `conda` is available on your PATH:
-
-```bash
-conda create -n gsforge python=3.10 -y
-conda activate gsforge
+```powershell
+curl -fsSL https://pixi.sh/install.sh | sh
 ```
 
-### 2. Install PyTorch with the correct CUDA version
+- **Windows**
 
-gsforge requires **PyTorch 2.4** with CUDA support. Install it **before** installing gsforge so pip resolves the correct CUDA-enabled wheels:
-
-```bash
-# CUDA 12.4 (required for the gsplat precompiled wheels)
-pip install torch==2.4.1 torchvision==0.19.1 torchaudio==2.4.1 --index-url https://download.pytorch.org/whl/cu124
+```powershell
+iwr -useb https://pixi.sh/install.ps1 | iex
 ```
 
-### 3. Install the NVIDIA CUDA Toolkit
+Verify with:
 
-gsplat is a **CUDA-accelerated** library. Without the CUDA Toolkit installed on your system, gsplat will print:
-
-```
-gsplat: No CUDA toolkit found. gsplat will be disabled.
+```powershell
+pixi --version
 ```
 
-and fall back to a very slow CPU-only mode (hours per training run instead of minutes).
+### 2. Install the NVIDIA CUDA Toolkit
 
-**Windows (VP workstations)**
+gsplat is a **CUDA-accelerated** library, using CUDA 12.4. Without the CUDA Toolkit installed on your system, gsplat will fall back to a very slow CPU-only mode (hours per training run instead of minutes).
+
+- Windows (VP workstations)
 
 1. Download **CUDA Toolkit 12.4** from:
    https://developer.nvidia.com/cuda-12-4-0-download-archive
@@ -62,7 +55,7 @@ and fall back to a very slow CPU-only mode (hours per training run instead of mi
 2. Run the installer. Select **Custom install** and ensure **CUDA Toolkit** is checked.
 3. Reboot after installation.
 
-**Linux**
+- Linux
 
 ```bash
 # Ubuntu 22.04 example (CUDA 12.4)
@@ -72,37 +65,24 @@ sudo apt update
 sudo apt install cuda-toolkit-12-4
 ```
 
-**Verify CUDA is installed**
+### 3. Install Dependancies
 
-```bash
-# Should show your GPU and driver version
+This will insall all the required packages to run the project.
+
+```powershell
+pixi install
+```
+
+Verify CUDA is installed:
+
+```powershell
 nvidia-smi
-
-# Should print: CUDA available: True
-python -c "import torch; print('CUDA available:', torch.cuda.is_available())"
+pixi run python -c "import torch; print(torch.__version__); print(torch.cuda.is_available())"
 ```
 
 > **CUDA version matching:** The CUDA Toolkit version must match the PyTorch CUDA build you installed in step 2. The gsplat precompiled wheels require **CUDA 12.4** (`cu124`) and **PyTorch 2.4** (`pt24`) — install CUDA Toolkit 12.4 to match.
 
-### 4. Install gsplat
-
-gsplat provides the CUDA-accelerated 3DGS rasteriser used for training:
-
-Before installing gsplat (latest version with wheel tailored to our conda environment), make sure we have the following installed.
-
-```bash
-pip install ninja jaxtyping rich
-```
-
-Then we can install gsplat.
-
-```bash
-pip install gsplat --index-url https://docs.gsplat.studio/whl/pt24cu124
-```
-
-If you see build errors during `pip install gsplat`, it usually means the CUDA Toolkit is missing or the version does not match PyTorch. See the [gsplat installation guide](https://docs.gsplat.studio/main/installation/installation.html) for troubleshooting.
-
-### 5. Install FFmpeg
+### 4. Install FFmpeg
 
 FFmpeg must be on your system PATH.
 
@@ -110,19 +90,24 @@ FFmpeg must be on your system PATH.
 - **Linux**: `sudo apt install ffmpeg`
 - **macOS**: `brew install ffmpeg`
 
-### 6. Install COLMAP 4.x
+### 5. Install COLMAP 4.x
 
 GLOMAP (the default SfM method) requires **COLMAP 4.0 or later**.
 
 - Download from [github.com/colmap/colmap/releases](https://github.com/colmap/colmap/releases)
 - Add the binary to PATH, **or** place it at `./bin/colmap` (or `./bin/colmap.exe` on Windows) for a project-local install.
 
-### 7. Install gsforge
+### 6. Install gsforge
 
 ```bash
 git clone https://github.com/your-org/gsforge.git
 cd gsforge
-pip install -e ".[dev]"
+```
+
+Enter the Pixi shell (do this each time you run the project from the CLI):
+
+```bash
+pixi shell
 ```
 
 Verify the install:

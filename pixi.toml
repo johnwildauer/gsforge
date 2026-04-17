@@ -1,0 +1,57 @@
+[workspace]
+name = "gsforge"
+version = "0.1.0"
+description = "CLI-first tool for virtual production 3D Gaussian Splatting workflows"
+channels = ["conda-forge"]
+platforms = ["win-64"]
+
+# Force Python 3.10 because your gsplat wheels require cp310 on Windows
+[dependencies]
+python = "3.10.*"
+
+[system-requirements]
+cuda = "12.4"
+
+# All PyPI dependencies (including the project itself in editable mode)
+[pypi-dependencies]
+# Your own project installed editable so `gsforge` command works
+gsforge = { path = ".", editable = true }
+
+# Core runtime dependencies (moved from pyproject.toml)
+typer = { version = ">=0.12" }
+rich = ">=13"
+tqdm = ">=4"
+ffmpeg-python = ">=0.2"
+Pillow = ">=10"
+opencv-python = ">=4.9"
+
+# CUDA-specific wheels (exact versions that work with your gsplat)
+torch = { version = "==2.4.1", index = "https://download.pytorch.org/whl/cu124" }
+torchvision = { version = "==0.19.1", index = "https://download.pytorch.org/whl/cu124" }
+torchaudio = { version = "==2.4.1", index = "https://download.pytorch.org/whl/cu124" }
+
+gsplat = { version = ">=1.3", index = "https://docs.gsplat.studio/whl/pt24cu124" }
+
+# Build helpers often needed
+ninja = ">=1.11"
+jaxtyping = ">=0.2"
+packaging = ">=23"
+setuptools = ">=68"
+
+# Dev environment
+[feature.dev.dependencies]
+pytest = ">=8"
+pytest-cov = "*"
+ruff = "*"
+mypy = "*"
+
+[environments]
+default = { solve-group = "default" }
+dev = { features = ["dev"], solve-group = "default" }
+
+# Convenient tasks
+[tasks]
+run = "gsforge"
+test = "pytest"
+lint = "ruff check ."
+format = "ruff format ."
