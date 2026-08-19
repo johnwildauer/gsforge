@@ -19,13 +19,19 @@ Design notes
 from __future__ import annotations
 
 import inspect
+import json
+import subprocess
 import struct
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from gsforge.sfm import (
+    ColmapCapabilityProbe,
     analyze_sparse_model,
     enumerate_sparse_models,
+    probe_colmap_capabilities,
     run_mapper,
     run_sfm,
     select_best_sparse_model,
@@ -62,6 +68,16 @@ def _make_sparse_model(parent: Path, name: str, num_images: int = 10) -> Path:
 def _make_colmap_bin() -> Path:
     """Return a fake colmap binary path (does not need to exist for mocked tests)."""
     return Path("/fake/colmap")
+
+
+COLMAP_4_1_1_GLOBAL_MAPPER_HELP = """COLMAP 4.1.1 (Commit a0d785f on 2026-07-17 with CUDA)
+Options:
+  -h [ --help ]
+--GlobalMapper.gp_use_gpu arg (=1)
+--GlobalMapper.gp_gpu_index arg (=-1)
+--GlobalMapper.ba_ceres_use_gpu arg (=1)
+--GlobalMapper.ba_ceres_gpu_index arg (=-1)
+"""
 
 
 def _capture_mapper_command(method: str) -> list[str]:
@@ -109,6 +125,8 @@ class TestRunMapper:
         assert "--GlobalMapper.ba_refine_extra_params" in cmd
         assert not any(arg.startswith("--Mapper.") for arg in cmd)
         assert "--Mapper.mapper_type" not in cmd
+        assert "--GlobalMapper.gp_use_gpu" in cmd
+        assert "--GlobalMapper.ba_ceres_use_gpu" in cmd
 
     def test_colmap_uses_incremental_mapper_and_mapper_options(self) -> None:
         cmd = _capture_mapper_command("colmap")
@@ -125,6 +143,255 @@ class TestRunMapper:
     def test_glomap_is_the_full_pipeline_default_method(self) -> None:
         assert DEFAULT_SFM_METHOD == "glomap"
         assert inspect.signature(run_sfm).parameters["method"].default == "glomap"
+
+
+class TestColmapCapabilityProbe:
+    def test_help_is_authoritative_when_version_is_unsupported(self) -> None:
+        calls: list[list[str]] = []
+
+        def _probe(cmd, **kwargs):
+            calls.append(cmd)
+            if cmd[-1] == "--version":
+                return MagicMock(
+                    returncode=1, stdout="", stderr="--version not recognized"
+                )
+            if cmd[-1] == "help":
+                return MagicMock(
+                    returncode=0,
+                    stdout="COLMAP 4.0.2\nAvailable commands:\n global_mapper\n mapper",
+                    stderr="",
+                )
+            if cmd[-1] == "version":
+                return MagicMock(returncode=0, stdout="COLMAP 4.0.2", stderr="")
+            return MagicMock(returncode=0, stdout="Options:\n --help", stderr="")
+
+        with patch("gsforge.sfm.subprocess.run", side_effect=_probe):
+            result = probe_colmap_capabilities(_make_colmap_bin())
+
+        assert result.binary_available is True
+        assert result.version == "4.0.2"
+        assert result.version_status == "unsupported"
+        assert result.commands["global_mapper"] == "supported"
+        assert result.raw_evidence["--version"]["returncode"] == 1
+        assert ["--version"] in [call[1:] for call in calls]
+        assert ["version"] in [call[1:] for call in calls]
+        assert ["-h"] in [call[1:] for call in calls]
+
+    def test_unusable_help_marks_binary_unavailable(self) -> None:
+        with patch(
+            "gsforge.sfm.subprocess.run",
+            side_effect=subprocess.TimeoutExpired(cmd="colmap", timeout=10),
+        ):
+            result = probe_colmap_capabilities(_make_colmap_bin())
+
+        assert result.binary_available is False
+        assert result.version_status == "unavailable"
+
+    def test_empty_successful_help_is_unusable(self) -> None:
+        def _probe(cmd, **kwargs):
+            return MagicMock(returncode=0, stdout="", stderr="")
+
+        with patch("gsforge.sfm.subprocess.run", side_effect=_probe):
+            result = probe_colmap_capabilities(_make_colmap_bin())
+
+        assert result.binary_available is False
+        assert result.version_status == "unavailable"
+
+    def test_cpu_fallback_warning_is_reported_for_glomap(self) -> None:
+        warning = (
+            "Requested to use GPU for bundle adjustment, but Ceres was compiled "
+            "without CUDA support. Falling back to CPU-based dense solvers."
+        )
+        result = MagicMock(returncode=0, stdout=warning, stderr="")
+        with (
+            patch("gsforge.sfm.subprocess.run", return_value=result),
+            patch("gsforge.sfm.log_warning") as log_warning_mock,
+        ):
+            run_mapper(
+                _make_colmap_bin(),
+                Path("/project/database.db"),
+                Path("/project/preprocess"),
+                Path("/project/sfm/sparse"),
+                "glomap",
+            )
+
+        log_warning_mock.assert_called_once()
+        assert "CPU bundle adjustment" in log_warning_mock.call_args.args[0]
+
+    def test_normal_ceres_report_does_not_emit_cpu_fallback_warning(self) -> None:
+        result = MagicMock(
+            returncode=0,
+            stdout=(
+                "Ceres Solver Report: Iterations: 52, Initial cost: "
+                "5.3e+06, Final cost: 2.7e+01, Termination: CONVERGENCE"
+            ),
+            stderr="",
+        )
+        with (
+            patch("gsforge.sfm.subprocess.run", return_value=result),
+            patch("gsforge.sfm.log_warning") as log_warning_mock,
+        ):
+            run_mapper(
+                _make_colmap_bin(),
+                Path("/project/database.db"),
+                Path("/project/preprocess"),
+                Path("/project/sfm/sparse"),
+                "glomap",
+            )
+
+        log_warning_mock.assert_not_called()
+
+    def test_colmap_411_global_mapper_gpu_contract_is_captured(self) -> None:
+        def _probe(cmd, **kwargs):
+            if cmd[1] == "help":
+                return MagicMock(
+                    returncode=0,
+                    stdout=(
+                        "COLMAP 4.1.1 -- Structure-from-Motion and Multi-View Stereo\n"
+                        "Available commands:\n mapper\n global_mapper\n"
+                    ),
+                    stderr="",
+                )
+            if cmd[1] == "global_mapper":
+                return MagicMock(
+                    returncode=0,
+                    stdout=COLMAP_4_1_1_GLOBAL_MAPPER_HELP,
+                    stderr="",
+                )
+            if cmd[1] == "-h":
+                return MagicMock(
+                    returncode=0,
+                    stdout=(
+                        "COLMAP 4.1.1\nAvailable commands:\n mapper\n global_mapper\n"
+                    ),
+                    stderr="",
+                )
+            return MagicMock(returncode=0, stdout="COLMAP 4.1.1", stderr="")
+
+        with patch("gsforge.sfm.subprocess.run", side_effect=_probe):
+            result = probe_colmap_capabilities(_make_colmap_bin())
+
+        assert result.version == "4.1.1"
+        assert result.commands["global_mapper"] == "supported"
+        assert result.commands["-h"] == "supported"
+        assert (
+            "--GlobalMapper.ba_ceres_use_gpu"
+            in result.raw_evidence["global_mapper"]["stdout"]
+        )
+        assert "Caspar" not in result.raw_evidence["global_mapper"]["stdout"]
+
+
+class TestRunSfmProbeIntegration:
+    def _project(self, tmp_path: Path) -> MagicMock:
+        project = MagicMock()
+        project.root = tmp_path
+        project.preprocess_dir = tmp_path / "preprocess"
+        project.sfm_dir = tmp_path / "sfm"
+        project.logs_dir = tmp_path / "logs"
+        project.preprocess_dir.mkdir()
+        (project.preprocess_dir / "frame_000001.png").write_bytes(b"frame")
+        return project
+
+    def _probe(self) -> ColmapCapabilityProbe:
+        return ColmapCapabilityProbe(
+            binary_available=True,
+            version="4.1.1",
+            version_status="unsupported",
+            commands={"help": "supported", "global_mapper": "supported"},
+            diagnostic="help is authoritative",
+        )
+
+    def test_rejected_version_metadata_does_not_stop_pipeline(
+        self, tmp_path: Path
+    ) -> None:
+        project = self._project(tmp_path)
+        sparse = tmp_path / "sfm" / "sparse" / "0"
+        sparse.mkdir(parents=True)
+        with (
+            patch("gsforge.sfm.find_colmap_binary", return_value=Path("colmap")),
+            patch("gsforge.sfm.probe_colmap_capabilities", return_value=self._probe()),
+            patch("gsforge.sfm.run_feature_extraction"),
+            patch("gsforge.sfm.run_feature_matching"),
+            patch("gsforge.sfm.run_mapper"),
+            patch("gsforge.sfm.select_best_sparse_model", return_value=sparse),
+            patch("gsforge.sfm.count_registered_cameras", return_value=1),
+            patch("gsforge.sfm.log_info"),
+        ):
+            result = run_sfm(project, method="glomap")
+
+        assert result.status == "completed"
+        evidence_path = project.logs_dir / "colmap-capability-probe.json"
+        assert evidence_path.exists()
+        evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+        assert evidence["version_status"] == "unsupported"
+        assert "raw_evidence" in evidence
+        project.update_after_sfm.assert_called_once()
+        assert project.update_after_sfm.call_args.kwargs["sfm_status"] == "completed"
+
+    def test_mapper_failure_persists_failed_state_without_switching_method(
+        self, tmp_path: Path
+    ) -> None:
+        project = self._project(tmp_path)
+        with (
+            patch("gsforge.sfm.find_colmap_binary", return_value=Path("colmap")),
+            patch("gsforge.sfm.probe_colmap_capabilities", return_value=self._probe()),
+            patch("gsforge.sfm.run_feature_extraction"),
+            patch("gsforge.sfm.run_feature_matching"),
+            patch("gsforge.sfm.run_mapper", side_effect=SystemExit(1)),
+            patch("gsforge.sfm.log_info"),
+        ):
+            with pytest.raises(SystemExit):
+                run_sfm(project, method="glomap")
+
+        update = project.update_after_sfm.call_args.kwargs
+        assert update["sfm_method"] == "glomap"
+        assert update["sfm_status"] == "failed"
+        assert update["camera_count"] == 0
+
+    def test_unusable_probe_persists_failed_state(self, tmp_path: Path) -> None:
+        project = self._project(tmp_path)
+        probe = ColmapCapabilityProbe(
+            binary_available=False,
+            version=None,
+            version_status="unavailable",
+            diagnostic="unusable help",
+        )
+        with (
+            patch("gsforge.sfm.find_colmap_binary", return_value=Path("colmap")),
+            patch("gsforge.sfm.probe_colmap_capabilities", return_value=probe),
+            patch("gsforge.sfm.log_info"),
+            patch("gsforge.sfm.run_feature_extraction") as extract,
+            patch("gsforge.sfm.run_feature_matching") as match,
+            patch("gsforge.sfm.run_mapper") as mapper,
+            patch("gsforge.sfm.log_error", side_effect=SystemExit(1)),
+        ):
+            with pytest.raises(SystemExit):
+                run_sfm(project, method="glomap")
+
+        update = project.update_after_sfm.call_args.kwargs
+        assert update["sfm_status"] == "failed"
+        assert update["camera_count"] == 0
+        extract.assert_not_called()
+        match.assert_not_called()
+        mapper.assert_not_called()
+
+    def test_probe_preserves_unavailable_subcommand_state(self) -> None:
+        def _probe(cmd, **kwargs):
+            if cmd[1] == "mapper":
+                raise FileNotFoundError("mapper probe failed")
+            if cmd[1] in {"help", "-h"}:
+                return MagicMock(
+                    returncode=0,
+                    stdout="COLMAP 4.1.1\nAvailable commands:\n mapper\n global_mapper\n",
+                    stderr="",
+                )
+            return MagicMock(returncode=0, stdout="COLMAP 4.1.1", stderr="")
+
+        with patch("gsforge.sfm.subprocess.run", side_effect=_probe):
+            result = probe_colmap_capabilities(_make_colmap_bin())
+
+        assert result.binary_available is True
+        assert result.commands["mapper"] == "unavailable"
 
 
 # ---------------------------------------------------------------------------
