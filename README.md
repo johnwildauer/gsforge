@@ -97,6 +97,20 @@ GLOMAP (the default SfM method) requires **COLMAP 4.0 or later**.
 - Download from [github.com/colmap/colmap/releases](https://github.com/colmap/colmap/releases)
 - Add the binary to PATH, **or** place it at `./bin/colmap` (or `./bin/colmap.exe` on Windows) for a project-local install.
 
+### Capture requirement: keep focal length consistent
+
+The reconstruction workflow requires source footage captured with a consistent focal length. Do not zoom, change lenses, or otherwise vary focal length during a shot intended for one reconstruction. gsforge does not currently perform automatic focal-length calibration; footage with changing focal length may prevent reliable camera registration and sparse reconstruction.
+
+### GLOMAP GPU bundle-adjustment note
+
+gsforge runs GLOMAP through COLMAP's `global_mapper`. Official COLMAP CUDA binaries support GPU feature extraction and matching, but their bundled Ceres solver may not include CUDA/cuDSS support. In that situation COLMAP reports the limitation and completes GLOMAP bundle adjustment on the CPU. This is expected behavior for the supported binary workflow: GLOMAP still runs, but bundle adjustment is not GPU-accelerated.
+
+The COLMAP FAQ explains that GPU Ceres/cuDSS requires compiling Ceres with CUDA/cuDSS support and linking that build into COLMAP. The ecosystem is waiting for Ceres 2.3 to be officially released and adopted by distributed binaries before this limitation is expected to disappear from standard installs. Caspar is another experimental GPU bundle-adjustment backend, but COLMAP currently does not expose a Caspar backend selector through `global_mapper`.
+
+Advanced users may compile COLMAP and its dependencies from source, including the Caspar build option where appropriate, and may need to adapt gsforge's external command configuration to match that custom build. This path is **untested, unsupported, and not part of the standard gsforge installation**. Do not assume that enabling Caspar makes it available to GLOMAP; validate the custom binary's `global_mapper -h` output and runtime logs first.
+
+For standard installations, a successful GLOMAP run with a clearly reported CPU bundle-adjustment fallback is considered valid. Users who require GPU bundle adjustment must maintain and validate their own compatible COLMAP/Ceres build.
+
 ### 6. Install gsforge
 
 ```bash

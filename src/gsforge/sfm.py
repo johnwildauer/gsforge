@@ -62,9 +62,10 @@ from __future__ import annotations
 import re
 import shutil
 import subprocess
-from dataclasses import dataclass
+import json
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Literal, Optional
+from typing import TYPE_CHECKING, Literal, Optional
 
 from gsforge.utils import (
     console,
@@ -75,6 +76,9 @@ from gsforge.utils import (
     log_success,
     log_warning,
 )
+
+if TYPE_CHECKING:
+    from gsforge.project import GSProject
 
 # ---------------------------------------------------------------------------
 # Type aliases
@@ -94,6 +98,28 @@ class SfmResult:
     status: str  # "completed" or "failed"
     camera_count: int  # number of cameras successfully registered
     sparse_dir: Path  # absolute path to the best sparse sub-model directory
+
+
+@dataclass
+class ColmapCapabilityProbe:
+    """Normalized evidence from probing a COLMAP executable."""
+
+    binary_available: bool
+    version: Optional[str]
+    version_status: Literal["known", "unsupported", "unknown", "unavailable"]
+    commands: dict[str, str] = field(default_factory=dict)
+    raw_evidence: dict[str, dict[str, object]] = field(default_factory=dict)
+    diagnostic: str = ""
+
+    def evidence_summary(self) -> str:
+        """Return a bounded, log-friendly summary of probe outcomes."""
+        states = ", ".join(
+            f"{name}={data.get('status', 'unknown')}"
+            for name, data in self.raw_evidence.items()
+        )
+        return (
+            f"{self.diagnostic}; version={self.version or 'unknown'}; probes=[{states}]"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -151,25 +177,140 @@ def find_colmap_binary() -> Path:
     raise RuntimeError("unreachable")
 
 
-def check_colmap_version(colmap_bin: Path) -> str:
-    """Return the COLMAP version string (e.g. '4.0.0').
+def probe_colmap_capabilities(colmap_bin: Path) -> ColmapCapabilityProbe:
+    """Probe COLMAP using supported help output instead of requiring ``--version``."""
 
-    We warn (but don't abort) if the version is < 4.0, because GLOMAP
-    requires 4.x but classic COLMAP still works on 3.x.
-    """
-    try:
-        result = subprocess.run(
-            [str(colmap_bin), "--version"],
-            capture_output=True,
-            text=True,
-            timeout=10,
+    evidence: dict[str, dict[str, object]] = {}
+
+    def run_probe(name: str, args: list[str]) -> tuple[bool, str, str]:
+        try:
+            result = subprocess.run(
+                [str(colmap_bin), *args],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+        except FileNotFoundError as exc:
+            evidence[name] = {"error": str(exc), "status": "unavailable"}
+            return False, "", "unavailable"
+        except subprocess.TimeoutExpired as exc:
+            evidence[name] = {"error": str(exc), "status": "unknown"}
+            return False, "", "unknown"
+        except OSError as exc:
+            evidence[name] = {"error": str(exc), "status": "unavailable"}
+            return False, "", "unavailable"
+
+        stdout = (result.stdout or "")[:4000]
+        stderr = (result.stderr or "")[:4000]
+        combined = f"{stdout}\n{stderr}".strip()
+        evidence[name] = {
+            "args": args,
+            "returncode": result.returncode,
+            "stdout": stdout,
+            "stderr": stderr,
+            "status": "supported" if result.returncode == 0 else "unsupported",
+        }
+        return (
+            result.returncode == 0,
+            combined,
+            "supported" if result.returncode == 0 else "unsupported",
         )
-        version_line = (result.stdout + result.stderr).strip().splitlines()[0]
-        log_info(f"COLMAP version: {version_line}")
-        return version_line
-    except Exception as exc:
-        log_warning(f"Could not determine COLMAP version: {exc}")
-        return "unknown"
+
+    _, version_text, version_result = run_probe("--version", ["--version"])
+    help_ok, help_text, help_result = run_probe("help", ["help"])
+    top_help_ok, top_help_text, top_help_result = run_probe("-h", ["-h"])
+    help_semantic = (
+        "colmap" in help_text.lower()
+        and "available commands" in help_text.lower()
+        and "global_mapper" in help_text
+        and "mapper" in help_text
+    )
+    if not help_ok or not help_semantic:
+        commands = {
+            "help": help_result,
+            "-h": top_help_result,
+            **{
+                command: "unavailable"
+                for command in (
+                    "feature_extractor",
+                    "exhaustive_matcher",
+                    "sequential_matcher",
+                    "mapper",
+                    "global_mapper",
+                )
+            },
+        }
+        return ColmapCapabilityProbe(
+            binary_available=False,
+            version=None,
+            version_status="unavailable",
+            commands=commands,
+            raw_evidence=evidence,
+            diagnostic="COLMAP could not provide semantically usable help output; the binary is unavailable or incompatible.",
+        )
+
+    version_command_ok, version_command_text, _ = run_probe("version", ["version"])
+    version_match = re.search(
+        r"COLMAP\s+(\d+(?:\.\d+){1,2})",
+        f"{version_text}\n{version_command_text}\n{help_text}",
+        re.IGNORECASE,
+    )
+    version = version_match.group(1) if version_match else None
+    if version_result == "unsupported":
+        version_status: Literal["known", "unsupported", "unknown", "unavailable"] = (
+            "unsupported"
+        )
+    elif version:
+        version_status = "known"
+    elif version_command_ok:
+        version_status = "known"
+    else:
+        version_status = "unknown"
+
+    top_help_semantic = (
+        "available commands" in top_help_text.lower()
+        and "global_mapper" in top_help_text
+    )
+    commands: dict[str, str] = {
+        "help": help_result,
+        "-h": "supported" if top_help_ok and top_help_semantic else "unknown",
+    }
+    for command in (
+        "feature_extractor",
+        "exhaustive_matcher",
+        "sequential_matcher",
+        "mapper",
+        "global_mapper",
+    ):
+        ok, command_text, status = run_probe(command, [command, "-h"])
+        semantically_usable = bool(command_text.strip()) and (
+            "--help" in command_text or "options" in command_text.lower()
+        )
+        if ok and semantically_usable:
+            commands[command] = "supported"
+        else:
+            commands[command] = status
+
+    diagnostic = "COLMAP capabilities discovered from help output"
+    if version_status != "known":
+        diagnostic += (
+            "; version metadata is unavailable but is not required for reconstruction"
+        )
+    return ColmapCapabilityProbe(
+        binary_available=True,
+        version=version,
+        version_status=version_status,
+        commands=commands,
+        raw_evidence=evidence,
+        diagnostic=diagnostic,
+    )
+
+
+def check_colmap_version(colmap_bin: Path) -> str:
+    """Backward-compatible version helper backed by the capability probe."""
+    probe = probe_colmap_capabilities(colmap_bin)
+    return probe.version or "unknown"
 
 
 # ---------------------------------------------------------------------------
@@ -183,6 +324,7 @@ def _run_colmap_step(
     args: list[str],
     *,
     step_name: str,
+    capture_output: bool = False,
 ) -> None:
     """Run a single COLMAP subcommand and raise on failure.
 
@@ -203,7 +345,7 @@ def _run_colmap_step(
     try:
         result = subprocess.run(
             cmd,
-            capture_output=False,  # let COLMAP print to terminal for live feedback
+            capture_output=capture_output,
             text=True,
             check=False,  # we check returncode manually for better messages
         )
@@ -219,6 +361,19 @@ def _run_colmap_step(
             "    • Images are too dark / blurry / textureless\n"
             "    • Insufficient GPU memory for feature extraction"
         )
+
+    if capture_output:
+        output = f"{result.stdout or ''}\n{result.stderr or ''}"
+        if output.strip():
+            console.print(output, end="")
+        if (
+            "compiled without CUDA support" in output
+            or "without cuDSS support" in output
+        ):
+            log_warning(
+                "GLOMAP completed with CPU bundle adjustment because the COLMAP Ceres "
+                "build lacks CUDA/cuDSS support. GLOMAP remained the selected mapper."
+            )
 
 
 def run_feature_extraction(
@@ -367,12 +522,22 @@ def run_mapper(
         f"--{option_namespace}.ba_refine_extra_params",
         "1",
     ]
+    if is_global:
+        args.extend(
+            [
+                "--GlobalMapper.gp_use_gpu",
+                "1",
+                "--GlobalMapper.ba_ceres_use_gpu",
+                "1",
+            ]
+        )
 
     _run_colmap_step(
         colmap_bin,
         subcommand,
         args,
         step_name=f"{subcommand} ({method})",
+        capture_output=is_global,
     )
 
 
@@ -658,8 +823,6 @@ def run_sfm(
     SfmResult
         Summary for the CLI summary table.
     """
-    from gsforge.project import GSProject
-
     # Validate preconditions
     project.require_ingest_done()
 
@@ -685,12 +848,35 @@ def run_sfm(
 
     database_path = sfm_dir / "database.db"
 
-    # Find COLMAP binary
-    colmap_bin = find_colmap_binary()
-    check_colmap_version(colmap_bin)
-
     # Run pipeline
     try:
+        # Find and probe COLMAP inside the failure-state boundary.  Some
+        # official binaries reject --version but provide usable help output.
+        colmap_bin = find_colmap_binary()
+        probe = probe_colmap_capabilities(colmap_bin)
+        log_info(probe.evidence_summary())
+        ensure_dir(project.logs_dir)
+        (project.logs_dir / "colmap-capability-probe.json").write_text(
+            json.dumps(
+                {
+                    "version": probe.version,
+                    "version_status": probe.version_status,
+                    "binary_available": probe.binary_available,
+                    "commands": probe.commands,
+                    "diagnostic": probe.diagnostic,
+                    "raw_evidence": probe.raw_evidence,
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        if not probe.binary_available:
+            project.update_after_sfm(
+                sfm_method=method,
+                sfm_status="failed",
+                camera_count=0,
+            )
+            log_error(probe.diagnostic)
         run_feature_extraction(colmap_bin, database_path, preprocess_dir)
         run_feature_matching(colmap_bin, database_path, num_images)
         run_mapper(colmap_bin, database_path, preprocess_dir, sparse_parent, method)
@@ -771,8 +957,6 @@ def import_colmap_reconstruction(
     int
         Number of cameras in the imported reconstruction.
     """
-    from gsforge.project import GSProject
-
     source_path = source_path.resolve()
 
     # Normalise: find the directory that actually contains the .bin files
@@ -864,8 +1048,6 @@ def export_colmap(
     output_path:
         Destination directory for the export.
     """
-    from gsforge.project import GSProject
-
     project.require_sfm_done()
 
     output_path = output_path.resolve()

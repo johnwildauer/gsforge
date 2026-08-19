@@ -64,7 +64,7 @@ Initialization must replace the placeholders in this section with facts for the 
 
 - **Repository type:** Python 3.10 CLI for virtual-production 3D Gaussian Splatting; Pixi/setuptools package with pytest, Ruff, and mypy dev tools (observed in [`pyproject.toml`](../../pyproject.toml:1) and [`pixi.toml`](../../pixi.toml:1)).
 - **Default branch:** `master` (observed from `.git/HEAD` and `.git/config`; origin is `johnwildauer/gsforge`).
-- **Initiative branch policy:** Create a dedicated development branch per initiative. Closeout merges that branch back into `master`, or into a specifically named release branch when that future policy is adopted. Branch naming format is not yet specified and must be chosen during initiative planning.
+- **Initiative branch policy:** Create a dedicated development branch per initiative. Closeout merges that branch back into `master`, or into a specifically named release branch when that future policy is adopted. The established naming format is `initiative/YYYY-MM-DD-short-slug`; the initiative plan must record the exact branch and branch creation evidence.
 - **Commit/pull-request policy:** Human review is required at the configured Forge gates. Exact hosting protection rules and required status checks are unknown; do not infer them as passing. Closeout must include human approval before merge.
 
 ### Commands
@@ -75,6 +75,7 @@ Initialization must replace the placeholders in this section with facts for the 
 - **Unit/integration tests:** `pixi run test` (declared in [`pixi.toml`](../../pixi.toml:55); equivalent `pytest`). Outcome: not executed; test files were inspected, but no pass/fail claim is made.
 - **Build/package:** `python -m build` is conventional but not declared; no repository build task was observed. Outcome: unknown/unverified.
 - **Run/manual verification:** `pixi run gsforge --help` or `gsforge --help`, then a manual workstation smoke test covering ingest, COLMAP/GLOMAP, training, preview/checkpoint creation, PLY inspection, and export. Outcome: not executed; external tools and GPU are manual gates.
+- **Terminal note:** The repository workflow is being operated from a Windows executable terminal for this initiative. PowerShell commands are not available in that terminal; validation plans must use executable-compatible commands or explicitly identify a required terminal change. This is an environment constraint, not a product requirement.
 
 ### Gates and intervention
 
@@ -82,6 +83,7 @@ Initialization must replace the placeholders in this section with facts for the 
 - **Implementation review cadence:** One independent review per work order by default.
 - **Manual/external gates:** Human approval after all work orders complete and before closeout/merge; real FFmpeg and COLMAP smoke test; CUDA/PyTorch/gsplat training smoke test; inspection of preview/checkpoint/final PLY/export artifacts; maintainer confirmation of unresolved product/implementation discrepancies.
 - **Automation bypasses:** None standing. A specific explicit human instruction may waive the design-loop or another gate only for that initiative, with the waiver and evidence recorded in its execution log.
+- **Review artifact location:** Initiative and work-order reviewers must write review artifacts under that initiative's `reviews/` directory. Work-order reviews use one artifact per work order; initiative design review and closeout review also remain in the same directory.
 - **Network or destructive-action restrictions:** Network access is limited to documented dependency/setup needs. Do not delete or overwrite user media, models, checkpoints, or exports without explicit authorization. Use isolated temporary project directories for smoke tests.
 
 ### Tools and parallelism
