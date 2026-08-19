@@ -11,8 +11,8 @@ classic incremental COLMAP it is:
     plagues incremental SfM on long sequences.
   - Equally accurate for well-constrained scenes (which VP footage always is).
 
-GLOMAP is invoked via the same ``colmap`` binary using the
-``mapper --MapperType GLOBAL`` flag introduced in COLMAP 4.0.
+GLOMAP is invoked via the same ``colmap`` binary using its
+``global_mapper`` subcommand introduced in COLMAP 4.0.
 Users only need to install COLMAP 4.x — no separate GLOMAP binary.
 
 Classic incremental COLMAP is still available via ``--method colmap`` for
@@ -31,9 +31,9 @@ COLMAP pipeline (both methods)
 -------------------------------
   1. feature_extractor  — SIFT features on every frame
   2. exhaustive_matcher (or sequential_matcher for large sets) — match pairs
-  3. mapper             — reconstruct cameras + sparse point cloud
-     - GLOMAP: --MapperType GLOBAL
-     - COLMAP: --MapperType INCREMENTAL (default)
+  3. mapper/global_mapper — reconstruct cameras + sparse point cloud
+     - GLOMAP: global_mapper
+     - COLMAP: mapper (incremental)
 
 Output
 ------
@@ -144,7 +144,7 @@ def find_colmap_binary() -> Path:
         "      and add to PATH, OR\n"
         "    • Place the binary at ./bin/colmap (or ./bin/colmap.exe on Windows)\n"
         "      for a project-local install.\n\n"
-        "  COLMAP 4.x is required for GLOMAP support (--MapperType GLOBAL).\n"
+        "  COLMAP 4.x is required for GLOMAP support (global_mapper).\n"
         "  COLMAP 3.x will work for classic incremental SfM only."
     )
     # log_error calls sys.exit — this line is unreachable but satisfies mypy
@@ -347,7 +347,10 @@ def run_mapper(
         ``"glomap"`` for global SfM (COLMAP 4.x required) or
         ``"colmap"`` for classic incremental SfM.
     """
-    mapper_type = "GLOBAL" if method == "glomap" else "INCREMENTAL"
+    is_global = method == "glomap"
+    subcommand = "global_mapper" if is_global else "mapper"
+    option_namespace = "GlobalMapper" if is_global else "Mapper"
+    mapper_type = "GLOBAL" if is_global else "INCREMENTAL"
     log_step("Mapper", f"method={method} ({mapper_type})")
 
     args = [
@@ -357,25 +360,19 @@ def run_mapper(
         str(image_path),
         "--output_path",
         str(output_path),
-        "--Mapper.ba_refine_focal_length",
+        f"--{option_namespace}.ba_refine_focal_length",
         "1",
-        "--Mapper.ba_refine_principal_point",
+        f"--{option_namespace}.ba_refine_principal_point",
         "0",  # VP cameras have known principal point
-        "--Mapper.ba_refine_extra_params",
+        f"--{option_namespace}.ba_refine_extra_params",
         "1",
     ]
 
-    # GLOMAP flag — only available in COLMAP 4.x
-    # If the user has COLMAP 3.x and chose glomap, COLMAP will error with a
-    # clear message about the unknown flag.
-    # if method == "glomap":
-    #     args += ["--Mapper.mapper_type", "GLOBAL"]
-
     _run_colmap_step(
         colmap_bin,
-        "mapper",
+        subcommand,
         args,
-        step_name=f"mapper ({method})",
+        step_name=f"{subcommand} ({method})",
     )
 
 

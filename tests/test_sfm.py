@@ -18,18 +18,19 @@ Design notes
 
 from __future__ import annotations
 
+import inspect
 import struct
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-import pytest
-
 from gsforge.sfm import (
     analyze_sparse_model,
-    count_registered_cameras,
     enumerate_sparse_models,
+    run_mapper,
+    run_sfm,
     select_best_sparse_model,
 )
+from gsforge.utils import DEFAULT_SFM_METHOD
 
 
 # ---------------------------------------------------------------------------
@@ -61,6 +62,69 @@ def _make_sparse_model(parent: Path, name: str, num_images: int = 10) -> Path:
 def _make_colmap_bin() -> Path:
     """Return a fake colmap binary path (does not need to exist for mocked tests)."""
     return Path("/fake/colmap")
+
+
+def _capture_mapper_command(method: str) -> list[str]:
+    captured: list[list[str]] = []
+
+    def _capture(cmd, **kwargs):
+        captured.append(cmd)
+        result = MagicMock()
+        result.returncode = 0
+        return result
+
+    with patch("gsforge.sfm.subprocess.run", side_effect=_capture):
+        run_mapper(
+            _make_colmap_bin(),
+            Path("/project/database.db"),
+            Path("/project/preprocess"),
+            Path("/project/sfm/sparse"),
+            method,  # type: ignore[arg-type]
+        )
+
+    assert len(captured) == 1
+    return captured[0]
+
+
+def _assert_shared_mapper_paths(cmd: list[str]) -> None:
+    assert cmd[cmd.index("--database_path") + 1] == str(Path("/project/database.db"))
+    assert cmd[cmd.index("--image_path") + 1] == str(Path("/project/preprocess"))
+    assert cmd[cmd.index("--output_path") + 1] == str(Path("/project/sfm/sparse"))
+
+
+# ---------------------------------------------------------------------------
+# run_mapper dispatch
+# ---------------------------------------------------------------------------
+
+
+class TestRunMapper:
+    def test_glomap_uses_global_mapper_and_global_options(self) -> None:
+        cmd = _capture_mapper_command("glomap")
+
+        assert cmd[0] == str(_make_colmap_bin())
+        assert cmd[1] == "global_mapper"
+        _assert_shared_mapper_paths(cmd)
+        assert "--GlobalMapper.ba_refine_focal_length" in cmd
+        assert "--GlobalMapper.ba_refine_principal_point" in cmd
+        assert "--GlobalMapper.ba_refine_extra_params" in cmd
+        assert not any(arg.startswith("--Mapper.") for arg in cmd)
+        assert "--Mapper.mapper_type" not in cmd
+
+    def test_colmap_uses_incremental_mapper_and_mapper_options(self) -> None:
+        cmd = _capture_mapper_command("colmap")
+
+        assert cmd[0] == str(_make_colmap_bin())
+        assert cmd[1] == "mapper"
+        _assert_shared_mapper_paths(cmd)
+        assert "--Mapper.ba_refine_focal_length" in cmd
+        assert "--Mapper.ba_refine_principal_point" in cmd
+        assert "--Mapper.ba_refine_extra_params" in cmd
+        assert not any(arg.startswith("--GlobalMapper.") for arg in cmd)
+        assert "--Mapper.mapper_type" not in cmd
+
+    def test_glomap_is_the_full_pipeline_default_method(self) -> None:
+        assert DEFAULT_SFM_METHOD == "glomap"
+        assert inspect.signature(run_sfm).parameters["method"].default == "glomap"
 
 
 # ---------------------------------------------------------------------------

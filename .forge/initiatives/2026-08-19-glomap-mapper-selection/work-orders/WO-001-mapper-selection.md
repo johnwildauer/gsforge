@@ -2,7 +2,7 @@
 
 ## Metadata
 
-- **Status:** `draft`
+- **Status:** `complete`
 - **Assignee:** `gsforge implementer`
 - **Phase/order:** `1`
 - **Initiative:** [`../initiative-v1.md`](../initiative-v1.md)
@@ -64,7 +64,7 @@ Determine the actual global-SfM command and accepted mapper options exposed by t
 
 ## Completion checklist
 
-- [ ] Implementation is complete within scope.
-- [ ] Tests/checks and required gates have evidence.
-- [ ] Authorized durable documentation is updated.
-- [ ] Execution log is appended.
+- [x] Implementation is complete within scope.
+- [x] Tests/checks and required gates have evidence.
+- [x] Authorized durable documentation is updated.
+- [x] Execution log is appended.
