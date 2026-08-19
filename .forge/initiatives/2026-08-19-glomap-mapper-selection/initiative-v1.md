@@ -2,11 +2,11 @@
 
 ## Initiative metadata
 
-- **Status:** `draft`
+- **Status:** `closed-with-follow-up`
 - **Owner/orchestrator:** `gsforge maintainers`
 - **Created:** `2026-08-19`
 - **Updated:** `2026-08-19`
-- **Current gate:** `planning`
+- **Current gate:** `closed`
 - **Authoritative version:** `v1`
 - **Development branch:** `initiative/2026-08-19-glomap-mapper-selection`
 
@@ -88,4 +88,4 @@ The gate passes only when B is visibly the global invocation rather than the inc
 - [x] Requirements and blueprints are linked.
 - [x] Work orders are independently executable and ordered.
 - [x] Validation commands and manual gates are identified.
-- [ ] Required human approval has been obtained or is pending at the documented gate.
+- [x] Required human approval has been obtained or is pending at the documented gate.
